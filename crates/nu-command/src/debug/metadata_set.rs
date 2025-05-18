@@ -63,7 +63,15 @@ impl Command for MetadataSet {
         match (ds_fp, ds_ls) {
             (Some(path), false) => metadata.data_source = DataSource::FilePath(path.into()),
             (None, true) => metadata.data_source = DataSource::Ls,
-            (Some(_), true) => (), // TODO: error here
+            (Some(_), true) => {
+                return Err(ShellError::GenericError {
+                    error: "Conflicting flags".into(),
+                    msg: "cannot use --datasource-filepath and --datasource-ls together".into(),
+                    span: Some(head),
+                    help: None,
+                    inner: vec![],
+                })
+            }
             (None, false) => (),
         }
 
@@ -96,8 +104,33 @@ impl Command for MetadataSet {
 #[cfg(test)]
 mod test {
     use crate::{Metadata, test_examples_with_commands};
+    use nu_cmd_lang::eval_pipeline_without_terminal_expression;
 
     use super::*;
+
+    #[test]
+    fn error_on_conflicting_flags() {
+        let mut engine_state = Box::new(EngineState::new());
+        let delta = {
+            let mut working_set = StateWorkingSet::new(&engine_state);
+            working_set.add_decl(Box::new(MetadataSet {}));
+            working_set.render()
+        };
+
+        engine_state
+            .merge_delta(delta)
+            .expect("Error merging delta");
+
+        let cmd = "1 | metadata set --datasource-ls --datasource-filepath foo";
+        let result = eval_pipeline_without_terminal_expression(
+            cmd,
+            std::env::temp_dir().as_ref(),
+            &mut engine_state,
+        )
+        .expect("There should be a result");
+
+        assert!(matches!(result, Value::Error { .. }));
+    }
 
     #[test]
     fn test_examples() {
