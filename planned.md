@@ -122,6 +122,32 @@ Set a read timeout on the underlying socket and retry in a loop while checking s
 - May need different implementations for different sources (File, UnixStream, etc.)
 - Could impact throughput if timeout is too aggressive
 
+## Implementation Status
+
+**✅ IMPLEMENTED** - Thread-based interruptible read has been implemented.
+
+### Changes Made
+
+**File: `crates/nu-protocol/src/pipeline/byte_stream.rs`**
+
+1. Added imports for `sync::mpsc` and `time::Duration`
+2. Created new `interruptible_read()` helper function (lines 806-877)
+3. Modified `Reader::read()` implementation (lines 888-900) to:
+   - Check signals first (fast path)
+   - Use direct read if signals are empty (common case, no overhead)
+   - Use interruptible read when signals are present
+
+**How it works:**
+- When signals are present, spawns a scoped thread to perform the blocking read
+- Main thread polls with 100ms timeout while checking for Ctrl+C
+- If Ctrl+C detected, returns immediately with Interrupted error
+- Scoped threads ensure proper cleanup and allow borrowing the reader
+
+**Performance impact:**
+- Zero overhead when signals are empty (most common case)
+- Only uses thread-based approach when signal handling is needed
+- Consistent with existing `send_cancellable_request()` pattern
+
 ## Recommended Implementation: Option 1 (Thread-Based)
 
 **Rationale:**

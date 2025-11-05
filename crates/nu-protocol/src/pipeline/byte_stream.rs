@@ -20,6 +20,8 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, Cursor, ErrorKind, Read, Write},
     process::Stdio,
+    sync::mpsc::{self, RecvTimeoutError},
+    time::Duration,
 };
 
 /// The source of bytes for a [`ByteStream`].
@@ -801,6 +803,79 @@ where
     }
 }
 
+/// Helper function to perform an interruptible read operation.
+///
+/// This spawns a background scoped thread to perform the blocking read, while the main thread
+/// polls for the result and checks for interrupt signals (like Ctrl+C).
+/// This is necessary to avoid blocking indefinitely when reading from slow streaming sources.
+fn interruptible_read(
+    reader: &mut (impl Read + Send),
+    buf: &mut [u8],
+    signals: &Signals,
+    span: Span,
+) -> io::Result<usize> {
+    let buf_len = buf.len();
+    let (tx, rx) = mpsc::channel::<io::Result<(Vec<u8>, usize)>>();
+
+    // Use scoped thread to allow borrowing the reader
+    std::thread::scope(|s| {
+        // Spawn a scoped thread to perform the blocking read
+        let handle = s.spawn(|| {
+            let mut temp_buf = vec![0u8; buf_len];
+            // Perform the blocking read operation
+            let result = match reader.read(&mut temp_buf) {
+                Ok(n) => Ok((temp_buf, n)),
+                Err(e) => Err(e),
+            };
+            // Send the result back (may fail if main thread cancelled)
+            let _ = tx.send(result);
+        });
+
+        // Poll for the result while checking for interrupt signals
+        loop {
+            // Check if we've been interrupted (Ctrl+C)
+            if let Err(shell_err) = signals.check(&span) {
+                // Note: The scoped thread will complete, but we're returning early
+                // The thread will be joined when the scope exits
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("Operation interrupted: {}", shell_err),
+                ));
+            }
+
+            // Check if the read operation completed (with 100ms timeout)
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok((data, n))) => {
+                    // Success! Copy the data to the user's buffer
+                    buf[..n].copy_from_slice(&data[..n]);
+                    return Ok(n);
+                }
+                Ok(Err(e)) => {
+                    // The read operation failed
+                    return Err(e);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Timeout, loop again to check signals
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    // Thread panicked or finished without sending? Wait for it to join
+                    return match handle.join() {
+                        Ok(_) => Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "Reader thread disconnected unexpectedly",
+                        )),
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "Reader thread panicked",
+                        )),
+                    };
+                }
+            }
+        }
+    })
+}
+
 pub struct Reader {
     reader: BufReader<SourceReader>,
     span: Span,
@@ -815,8 +890,17 @@ impl Reader {
 
 impl Read for Reader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Check signals first (fast path for already-interrupted case)
         self.signals.check(&self.span).map_err(ShellErrorBridge)?;
-        self.reader.read(buf)
+
+        // If signals are empty (common case), just do the read directly
+        if self.signals.is_empty() {
+            return self.reader.read(buf);
+        }
+
+        // Otherwise, use interruptible read to avoid blocking indefinitely
+        // This is important for streaming responses where data arrives slowly
+        interruptible_read(&mut self.reader, buf, &self.signals, self.span)
     }
 }
 
