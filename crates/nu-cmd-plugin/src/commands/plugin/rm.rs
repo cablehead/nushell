@@ -108,6 +108,21 @@ fixed with `plugin add`.
             }
         })?;
 
+        // After removing from registry, stop the running plugin instance to ensure
+        // any background jobs are cleaned up
+        for plugin in engine_state.plugins() {
+            let id = plugin.identity();
+            if id.name() == name.item || id.filename() == filename {
+                if let Err(err) = plugin.stop() {
+                    log::warn!(
+                        "Failed to stop plugin {} during removal: {err}",
+                        name.item
+                    );
+                }
+                break;
+            }
+        }
+
         Ok(Value::nothing(call.head).into_pipeline_data())
     }
 }

@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nu_plugin_core::interface_test_util::TestCase;
 use nu_plugin_protocol::{PluginInput, PluginOutput, test_util::test_plugin_custom_value};
+use nu_protocol::engine::Jobs;
 
 use crate::{PluginCustomValueWithSource, PluginInterfaceManager, PluginSource};
 
@@ -12,7 +13,12 @@ pub trait TestCaseExt {
 
 impl TestCaseExt for TestCase<PluginOutput, PluginInput> {
     fn plugin(&self, name: &str) -> PluginInterfaceManager {
-        PluginInterfaceManager::new(PluginSource::new_fake(name).into(), None, self.clone())
+        PluginInterfaceManager::new(
+            PluginSource::new_fake(name).into(),
+            None,
+            self.clone(),
+            Arc::new(Mutex::new(Jobs::default())),
+        )
     }
 }
 

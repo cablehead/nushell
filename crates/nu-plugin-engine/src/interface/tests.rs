@@ -1658,13 +1658,13 @@ fn plugin_call_state_drop_cleans_up_jobs() -> Result<(), ShellError> {
 
     // Add the job to the table and get its ID
     let job_id = {
-        let mut jobs_guard = jobs.lock().expect("failed to lock jobs");
+        let mut jobs_guard = jobs.lock().expect("jobs mutex poisoned during test setup");
         jobs_guard.add_job(job)
     };
 
     // Verify the job exists before cleanup
     {
-        let jobs_guard = jobs.lock().expect("failed to lock jobs");
+        let jobs_guard = jobs.lock().expect("jobs mutex poisoned during test verification");
         assert!(
             jobs_guard.lookup(job_id).is_some(),
             "job should exist before PluginCallState drop"
@@ -1691,10 +1691,203 @@ fn plugin_call_state_drop_cleans_up_jobs() -> Result<(), ShellError> {
 
     // Verify the job was cleaned up
     {
-        let jobs_guard = jobs.lock().expect("failed to lock jobs");
+        let jobs_guard = jobs.lock().expect("jobs mutex poisoned during cleanup verification");
         assert!(
             jobs_guard.lookup(job_id).is_none(),
             "job should be cleaned up after PluginCallState drop"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn plugin_interface_drop_cleans_up_all_plugin_jobs() -> Result<(), ShellError> {
+    // This test verifies that when a PluginInterface is dropped (plugin stops), it properly
+    // cleans up ALL background jobs for that plugin, regardless of call_id.
+
+    let plugin_name = "test_plugin";
+
+    // Create a shared Jobs table
+    let jobs = Arc::new(Mutex::new(Jobs::default()));
+
+    // Create multiple background jobs with different call_ids for the same plugin
+    let call_ids = vec![1, 2, 3];
+    let job_ids: Vec<_> = call_ids
+        .iter()
+        .map(|call_id| {
+            let (sender, _receiver) = mpsc::channel();
+            let job = Job::Thread(ThreadJob::new(
+                Signals::empty(),
+                Some(format!("plugin:{plugin_name}:{call_id}")),
+                sender,
+            ));
+
+            let mut jobs_guard = jobs.lock().expect("jobs mutex poisoned during test setup");
+            jobs_guard.add_job(job)
+        })
+        .collect();
+
+    // Also add a job for a different plugin to verify it's not affected
+    let other_plugin_job_id = {
+        let (sender, _receiver) = mpsc::channel();
+        let job = Job::Thread(ThreadJob::new(
+            Signals::empty(),
+            Some("plugin:other_plugin:1".into()),
+            sender,
+        ));
+
+        let mut jobs_guard = jobs.lock().expect("jobs mutex poisoned during test setup");
+        jobs_guard.add_job(job)
+    };
+
+    // Verify all jobs exist before cleanup
+    {
+        let jobs_guard = jobs.lock().expect("jobs mutex poisoned during test verification");
+        for job_id in &job_ids {
+            assert!(
+                jobs_guard.lookup(*job_id).is_some(),
+                "job {job_id} should exist before PluginInterface drop"
+            );
+        }
+        assert!(
+            jobs_guard.lookup(other_plugin_job_id).is_some(),
+            "other plugin job should exist"
+        );
+    }
+
+    // Create a PluginInterface with the jobs table
+    // To test the Drop implementation, we need to create an interface with the shared state
+    let source = Arc::new(PluginSource::new_fake(plugin_name));
+    let (tx, _rx) = mpsc::channel();
+    let encoder = nu_plugin_core::JsonSerializer {};
+    let writer = (std::sync::Mutex::new(Vec::new()), encoder);
+
+    let manager = PluginInterfaceManager::new(source, None, writer, jobs.clone());
+    let interface = manager.get_interface();
+
+    // Drop the interface - this should trigger cleanup of all jobs for this plugin
+    // Since we're testing the Drop implementation, we need to ensure there are no other
+    // references to the state. The manager holds one reference and the interface holds one.
+    // We need to drop both.
+    drop(interface);
+    drop(manager);
+
+    // Verify all jobs for test_plugin were cleaned up
+    {
+        let jobs_guard = jobs.lock().expect("jobs mutex poisoned during cleanup verification");
+        for job_id in &job_ids {
+            assert!(
+                jobs_guard.lookup(*job_id).is_none(),
+                "job {job_id} should be cleaned up after PluginInterface drop"
+            );
+        }
+        // Verify the other plugin's job was not affected
+        assert!(
+            jobs_guard.lookup(other_plugin_job_id).is_some(),
+            "other plugin job should still exist"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn multiple_concurrent_calls_independent_cleanup() -> Result<(), ShellError> {
+    // This test verifies that multiple concurrent plugin calls clean up their jobs
+    // independently when each call completes.
+
+    let plugin_name = "test_plugin";
+    let jobs = Arc::new(Mutex::new(Jobs::default()));
+
+    // Create two plugin calls with different call_ids
+    let call_id_1 = 100;
+    let call_id_2 = 200;
+
+    // Create jobs for each call
+    let job_id_1 = {
+        let (sender, _receiver) = mpsc::channel();
+        let job = Job::Thread(ThreadJob::new(
+            Signals::empty(),
+            Some(format!("plugin:{plugin_name}:{call_id_1}")),
+            sender,
+        ));
+        let mut jobs_guard = jobs.lock().expect("jobs mutex poisoned during test setup");
+        jobs_guard.add_job(job)
+    };
+
+    let job_id_2 = {
+        let (sender, _receiver) = mpsc::channel();
+        let job = Job::Thread(ThreadJob::new(
+            Signals::empty(),
+            Some(format!("plugin:{plugin_name}:{call_id_2}")),
+            sender,
+        ));
+        let mut jobs_guard = jobs.lock().expect("jobs mutex poisoned during test setup");
+        jobs_guard.add_job(job)
+    };
+
+    // Create PluginCallState for the first call
+    let (tx1, _rx1) = mpsc::channel();
+    let state_1 = PluginCallState {
+        sender: Some(tx1),
+        dont_send_response: false,
+        signals: Signals::empty(),
+        context_rx: None,
+        span: None,
+        keep_plugin_custom_values: mpsc::channel(),
+        remaining_streams_to_read: 0,
+        call_id: call_id_1,
+        plugin_name: plugin_name.into(),
+        jobs: jobs.clone(),
+    };
+
+    // Verify both jobs exist
+    {
+        let jobs_guard = jobs.lock().expect("jobs mutex poisoned during test verification");
+        assert!(jobs_guard.lookup(job_id_1).is_some(), "job 1 should exist");
+        assert!(jobs_guard.lookup(job_id_2).is_some(), "job 2 should exist");
+    }
+
+    // Drop the first call state - should only clean up job_id_1
+    drop(state_1);
+
+    // Verify only job_id_1 was cleaned up
+    {
+        let jobs_guard = jobs.lock().expect("jobs mutex poisoned during cleanup verification");
+        assert!(
+            jobs_guard.lookup(job_id_1).is_none(),
+            "job 1 should be cleaned up"
+        );
+        assert!(
+            jobs_guard.lookup(job_id_2).is_some(),
+            "job 2 should still exist"
+        );
+    }
+
+    // Now create and drop the second call state
+    let (tx2, _rx2) = mpsc::channel();
+    let state_2 = PluginCallState {
+        sender: Some(tx2),
+        dont_send_response: false,
+        signals: Signals::empty(),
+        context_rx: None,
+        span: None,
+        keep_plugin_custom_values: mpsc::channel(),
+        remaining_streams_to_read: 0,
+        call_id: call_id_2,
+        plugin_name: plugin_name.into(),
+        jobs: jobs.clone(),
+    };
+
+    drop(state_2);
+
+    // Verify job_id_2 was also cleaned up
+    {
+        let jobs_guard = jobs.lock().expect("jobs mutex poisoned during cleanup verification");
+        assert!(
+            jobs_guard.lookup(job_id_2).is_none(),
+            "job 2 should be cleaned up"
         );
     }
 

@@ -8,7 +8,7 @@ use nu_plugin_core::CommunicationMode;
 use nu_protocol::{
     HandlerGuard, Handlers, PluginGcConfig, PluginIdentity, PluginMetadata, RegisteredPlugin,
     ShellError,
-    engine::{EngineState, Stack},
+    engine::{EngineState, Jobs, Stack},
     shell_error::io::IoError,
 };
 use std::{
@@ -79,6 +79,7 @@ impl PersistentPlugin {
     /// spawned.
     pub fn get(
         self: Arc<Self>,
+        jobs: Arc<Mutex<Jobs>>,
         envs: impl FnOnce() -> Result<HashMap<String, String>, ShellError>,
     ) -> Result<PluginInterface, ShellError> {
         let mut mutable = self.mutable.lock().map_err(|_| ShellError::NushellFailed {
@@ -101,7 +102,7 @@ impl PersistentPlugin {
             // TODO: We should probably store the envs somewhere, in case we have to launch without
             // envs (e.g. from a custom value)
             let envs = envs()?;
-            let result = self.clone().spawn(&envs, &mut mutable);
+            let result = self.clone().spawn(&envs, jobs.clone(), &mut mutable);
 
             // Check if we were using an alternate communication mode and may need to fall back to
             // stdio.
@@ -118,7 +119,7 @@ impl PersistentPlugin {
                 );
                 // Reset to stdio and try again, but this time don't catch any error
                 mutable.preferred_mode = Some(PreferredCommunicationMode::Stdio);
-                self.clone().spawn(&envs, &mut mutable)?;
+                self.clone().spawn(&envs, jobs, &mut mutable)?;
             }
 
             Ok(mutable
@@ -136,6 +137,7 @@ impl PersistentPlugin {
     fn spawn(
         self: Arc<Self>,
         envs: &HashMap<String, String>,
+        jobs: Arc<Mutex<Jobs>>,
         mutable: &mut MutableState,
     ) -> Result<(), ShellError> {
         // Make sure `running` is set to None to begin
@@ -200,6 +202,7 @@ impl PersistentPlugin {
             Arc::new(PluginSource::new(self.clone())),
             Some(pid),
             Some(gc.clone()),
+            jobs,
         )?;
 
         // If our current preferred mode is None, check to see if the plugin might support another
@@ -339,7 +342,7 @@ impl RegisteredPlugin for PersistentPlugin {
 /// Anything that can produce a plugin interface.
 pub trait GetPlugin: RegisteredPlugin {
     /// Retrieve or spawn a [`PluginInterface`]. The `context` may be used for determining
-    /// environment variables to launch the plugin with.
+    /// environment variables to launch the plugin with and for accessing the jobs table.
     fn get_plugin(
         self: Arc<Self>,
         context: Option<(&EngineState, &mut Stack)>,
@@ -351,7 +354,13 @@ impl GetPlugin for PersistentPlugin {
         self: Arc<Self>,
         mut context: Option<(&EngineState, &mut Stack)>,
     ) -> Result<PluginInterface, ShellError> {
-        self.get(|| {
+        // Get the jobs table from the context, or create a default one if not available
+        let jobs = context
+            .as_ref()
+            .map(|(engine_state, _)| engine_state.jobs.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(Jobs::default())));
+
+        self.get(jobs, || {
             // Get envs from the context if provided.
             let envs = context
                 .as_mut()

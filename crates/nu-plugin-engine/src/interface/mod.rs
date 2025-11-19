@@ -82,6 +82,8 @@ struct PluginInterfaceState {
     error: OnceLock<ShellError>,
     /// The synchronized output writer
     writer: Box<dyn PluginWrite<PluginInput>>,
+    /// The jobs table for managing and cleaning up background jobs
+    jobs: Arc<Mutex<Jobs>>,
 }
 
 impl std::fmt::Debug for PluginInterfaceState {
@@ -96,6 +98,7 @@ impl std::fmt::Debug for PluginInterfaceState {
                 &self.plugin_call_subscription_sender,
             )
             .field("error", &self.error)
+            .field("jobs", &self.jobs)
             .finish_non_exhaustive()
     }
 }
@@ -178,6 +181,7 @@ impl PluginInterfaceManager {
         source: Arc<PluginSource>,
         pid: Option<u32>,
         writer: impl PluginWrite<PluginInput> + 'static,
+        jobs: Arc<Mutex<Jobs>>,
     ) -> PluginInterfaceManager {
         let (subscription_tx, subscription_rx) = mpsc::channel();
         let protocol_info_mut = WaitableMut::new();
@@ -192,6 +196,7 @@ impl PluginInterfaceManager {
                 plugin_call_subscription_sender: subscription_tx,
                 error: OnceLock::new(),
                 writer: Box::new(writer),
+                jobs,
             }),
             protocol_info_mut,
             stream_manager: StreamManager::new(),
@@ -325,7 +330,9 @@ impl PluginInterfaceManager {
                     keep_plugin_custom_values_tx: Some(state.keep_plugin_custom_values.0.clone()),
                     entered_foreground: false,
                     span: state.span,
-                    call_id: None, // No call_id for background engine call handler
+                    // Use the original call_id so that background jobs spawned by engine calls
+                    // are properly tagged and cleaned up when the original plugin call completes
+                    call_id: Some(state.call_id),
                 };
 
                 let handler = move || {
@@ -774,11 +781,6 @@ impl PluginInterface {
         let dont_send_response =
             matches!(call, PluginCall::CustomValueOp(_, CustomValueOp::Dropped));
 
-        // Get the jobs table from context, if available
-        let jobs = context
-            .map(|c| c.jobs())
-            .unwrap_or_else(|| Arc::new(Mutex::new(Jobs::default())));
-
         // Register the subscription to the response, and the context
         self.state
             .plugin_call_subscription_sender
@@ -794,7 +796,7 @@ impl PluginInterface {
                     remaining_streams_to_read: 0,
                     call_id: id,
                     plugin_name: self.state.source.identity.name().into(),
-                    jobs,
+                    jobs: self.state.jobs.clone(),
                 },
             ))
             .map_err(|_| {
@@ -1197,10 +1199,42 @@ impl Drop for PluginInterface {
         //
         // Our copy is about to be dropped, so there would only be one left, the manager. The
         // manager will never send any plugin calls, so we should let the plugin know that.
-        if Arc::strong_count(&self.state) < 3
-            && let Err(err) = self.goodbye()
-        {
-            log::warn!("Error during plugin Goodbye: {err}");
+        if Arc::strong_count(&self.state) < 3 {
+            if let Err(err) = self.goodbye() {
+                log::warn!("Error during plugin Goodbye: {err}");
+            }
+
+            // Clean up all background jobs spawned by this plugin. We use a tag prefix to match
+            // all jobs for this plugin regardless of call_id.
+            let tag_prefix = format!("plugin:{}:", self.state.source.identity.name());
+            if let Ok(mut jobs_guard) = self.state.jobs.lock() {
+                // Find all jobs that start with the plugin tag prefix
+                let jobs_to_kill: Vec<_> = jobs_guard
+                    .iter()
+                    .filter(|(_, job)| {
+                        job.tag()
+                            .map(|t| t.starts_with(&tag_prefix))
+                            .unwrap_or(false)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+
+                // Kill and remove each matching job
+                for job_id in jobs_to_kill {
+                    if let Err(err) = jobs_guard.kill_and_remove(job_id) {
+                        log::warn!(
+                            "Failed to kill job {} for plugin {}: {err}",
+                            job_id,
+                            self.state.source.identity.name()
+                        );
+                    }
+                }
+            } else {
+                log::warn!(
+                    "Failed to acquire jobs lock to clean up jobs for plugin {}",
+                    self.state.source.identity.name()
+                );
+            }
         }
     }
 }

@@ -16,7 +16,9 @@ use nu_plugin_core::{
 };
 use nu_protocol::{
     PluginIdentity, PluginRegistryFile, PluginRegistryItem, PluginRegistryItemData,
-    RegisteredPlugin, ShellError, Span, engine::StateWorkingSet, report_shell_error,
+    RegisteredPlugin, ShellError, Span,
+    engine::{Jobs, StateWorkingSet},
+    report_shell_error,
 };
 
 use crate::{
@@ -109,6 +111,7 @@ pub fn make_plugin_interface(
     source: Arc<PluginSource>,
     pid: Option<u32>,
     gc: Option<PluginGc>,
+    jobs: Arc<Mutex<Jobs>>,
 ) -> Result<PluginInterface, ShellError> {
     match comm.connect(&mut child)? {
         ServerCommunicationIo::Stdio(stdin, stdout) => make_plugin_interface_with_streams(
@@ -120,6 +123,7 @@ pub fn make_plugin_interface(
             source,
             pid,
             gc,
+            jobs,
         ),
         #[cfg(feature = "local-socket")]
         ServerCommunicationIo::LocalSocket { read_out, write_in } => {
@@ -132,6 +136,7 @@ pub fn make_plugin_interface(
                 source,
                 pid,
                 gc,
+                jobs,
             )
         }
     }
@@ -143,6 +148,7 @@ pub fn make_plugin_interface(
 /// - `source` is required so that custom values produced by the plugin can spawn it.
 /// - `pid` may be provided for process management (e.g. `EnterForeground`).
 /// - `gc` may be provided for communication with the plugin's GC (e.g. `SetGcDisabled`).
+/// - `jobs` is the shared jobs table for managing background jobs.
 pub fn make_plugin_interface_with_streams(
     mut reader: impl std::io::Read + Send + 'static,
     writer: impl std::io::Write + Send + 'static,
@@ -150,6 +156,7 @@ pub fn make_plugin_interface_with_streams(
     source: Arc<PluginSource>,
     pid: Option<u32>,
     gc: Option<PluginGc>,
+    jobs: Arc<Mutex<Jobs>>,
 ) -> Result<PluginInterface, ShellError> {
     let encoder = get_plugin_encoding(&mut reader)?;
 
@@ -157,7 +164,7 @@ pub fn make_plugin_interface_with_streams(
     let writer = BufWriter::with_capacity(OUTPUT_BUFFER_SIZE, writer);
 
     let mut manager =
-        PluginInterfaceManager::new(source.clone(), pid, (Mutex::new(writer), encoder));
+        PluginInterfaceManager::new(source.clone(), pid, (Mutex::new(writer), encoder), jobs);
     manager.set_garbage_collector(gc);
 
     let interface = manager.get_interface();
