@@ -20,6 +20,7 @@ pub use dir_info::{DirBuilder, DirInfo, FileInfo};
 pub use input::Input;
 pub use input::InputList;
 pub use input::InputListen;
+pub use input::InputStream;
 pub use is_terminal::IsTerminal;
 pub use kill::Kill;
 pub use sleep::Sleep;
