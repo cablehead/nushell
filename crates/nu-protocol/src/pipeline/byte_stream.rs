@@ -1125,6 +1125,10 @@ pub fn copy_with_signals(
                 writer.flush().map_err(&from_io_error)?;
                 Ok(n)
             }
+            // A broken pipe means the consumer stopped reading (e.g. `... | head`,
+            // or an external command that closed its stdin / exited). That is a
+            // normal end of output, not an error.
+            Err(err) if err.kind() == ErrorKind::BrokenPipe => Ok(0),
             Err(err) => {
                 let _ = writer.flush();
                 match ShellErrorBridge::try_from(err) {
@@ -1172,8 +1176,13 @@ fn generic_copy(
                 Err(e) => return Err(from_io_error(e).into()),
             },
         };
-        len += n;
-        writer.write_all(&buf[..n]).map_err(&from_io_error)?;
+        // A broken pipe means the consumer stopped reading; normal end of
+        // output, not an error.
+        match writer.write_all(&buf[..n]) {
+            Ok(()) => len += n,
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => break,
+            Err(e) => return Err(from_io_error(e).into()),
+        }
     }
     Ok(len as u64)
 }

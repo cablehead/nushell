@@ -398,12 +398,36 @@ impl IoError {
     /// take the same span and path.
     /// Instead of calling `.map_err(|err| IoError::new(err, span, path))` every time, you
     /// can create the factory closure once and pass that into `.map_err`.
+    #[track_caller]
     pub fn factory<'p, P>(span: Span, path: P) -> impl Fn(std::io::Error) -> Self + use<'p, P>
     where
         P: Into<Option<&'p Path>>,
     {
         let path = path.into();
-        move |err: std::io::Error| IoError::new(err, span, path.map(PathBuf::from))
+        // Captured at the call site of `factory` (via `#[track_caller]`) so that
+        // errors on streams without a user-code span can still be traced to the
+        // Rust code that produced them.
+        let location = Location::caller();
+        move |err: std::io::Error| {
+            if span == Span::unknown() {
+                // There is no user-code span to anchor this error to (e.g. an
+                // internally-synthesized `ByteStream`). Route through the
+                // internal constructor, which records the Rust call site,
+                // instead of the user-facing `new`, which would build an
+                // unanchored error and trip its own `debug_assert!`.
+                match path {
+                    Some(path) => IoError::new_internal_with_path_and_location(
+                        err,
+                        "I/O error",
+                        PathBuf::from(path),
+                        location,
+                    ),
+                    None => IoError::new_internal_with_location(err, "I/O error", location),
+                }
+            } else {
+                IoError::new(err, span, path.map(PathBuf::from))
+            }
+        }
     }
 }
 
