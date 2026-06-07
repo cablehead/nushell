@@ -1322,4 +1322,36 @@ mod tests {
         // Once it's in binary mode it won't go back
         assert_eq!(Value::test_binary(b"efgh"), get());
     }
+
+    #[test]
+    fn copy_with_signals_brokenpipe_unknown_span_is_clean_stop() {
+        // Regression: when data is fed into an external command's stdin and the
+        // command has already closed it (e.g. `head`, or `websocat` after its
+        // socket dropped), the write fails with `BrokenPipe`. If the source
+        // `ByteStream` carries `Span::unknown()` (an internally-synthesized
+        // stream with no source location), the write-error path constructs the
+        // user-facing `IoError::new(.., Span::unknown(), None)`, which trips a
+        // `debug_assert!` in `IoError::new` and panics in debug builds.
+        //
+        // A broken pipe on the feeder is a normal "the consumer stopped
+        // reading" signal, not an error, and must be a clean stop, never a
+        // panic.
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let data = b"bytes destined for a stdin that is already closed";
+        let result = copy_with_signals(&data[..], BrokenPipe, Span::unknown(), &Signals::empty());
+
+        assert!(
+            result.is_ok(),
+            "broken pipe on an unknown-span stream should be a clean stop, got {result:?}"
+        );
+    }
 }
