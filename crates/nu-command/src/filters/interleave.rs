@@ -1,6 +1,13 @@
 use nu_engine::{ClosureEvalOnce, command_prelude::*};
-use nu_protocol::{engine::Closure, shell_error::io::IoError};
-use std::{sync::mpsc, thread};
+use nu_protocol::{Signals, engine::Closure, shell_error::io::IoError};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+};
 
 #[derive(Clone)]
 pub struct Interleave;
@@ -114,24 +121,43 @@ interleave
 
         let (tx, rx) = mpsc::sync_channel(buffer_size);
 
+        // Scoped cancellation: when downstream drops, we want sibling worker
+        // threads to unwind even if they're parked in blocking commands like
+        // `sleep`, `input listen`, or `http get`. We give each worker an
+        // `EngineState` whose `Signals` chains the parent's Ctrl-C flag with a
+        // local flag that we trigger on `tx.send` failure. Commands that
+        // already check `engine_state.signals()` between blocking calls (e.g.
+        // `sleep`) get cancellation for free; the parent's Ctrl-C still
+        // propagates because it lives in the chain too.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let scoped_signals =
+            Signals::chain(engine_state.signals().clone(), cancel.clone());
+        let scoped_state = {
+            let mut s = engine_state.clone();
+            s.set_signals(scoped_signals);
+            Arc::new(s)
+        };
+
         // Spawn the threads for the input and closure outputs
         (!input.is_nothing())
             .then(|| Ok(input))
             .into_iter()
             .chain(closures.into_iter().map(|closure| {
-                ClosureEvalOnce::new(engine_state, stack, closure)
+                ClosureEvalOnce::new(&scoped_state, stack, closure)
                     .run_with_input(PipelineData::empty())
             }))
             .try_for_each(|stream| {
                 stream.and_then(|stream| {
                     // Then take the stream and spawn a thread to send it to our channel
                     let tx = tx.clone();
+                    let cancel = cancel.clone();
                     thread::Builder::new()
                         .name("interleave consumer".into())
                         .spawn(move || {
                             for value in stream {
                                 if tx.send(value).is_err() {
-                                    // Stop sending if the channel is dropped
+                                    // Downstream is gone: tell siblings to stop too.
+                                    cancel.store(true, Ordering::Relaxed);
                                     break;
                                 }
                             }

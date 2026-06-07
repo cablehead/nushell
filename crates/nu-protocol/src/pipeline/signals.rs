@@ -8,17 +8,30 @@ use std::sync::{
 
 /// Used to check for signals to suspend or terminate the execution of Nushell code.
 ///
-/// For now, this struct only supports interruption (ctrl+c or SIGINT).
+/// A `Signals` can hold a primary source (the engine-wide Ctrl-C flag) and any
+/// number of *additional* sources chained via [`Signals::chain`]. An interrupt
+/// is observed when any source flag is set; this lets a parent's Ctrl-C and a
+/// scoped local cancellation flag (e.g. one owned by `interleave`) coexist
+/// without the local flag cascading back into the parent.
+///
+/// The struct is intentionally pointer-sized: `Value::Range` and `Value::List`
+/// embed `Option<Signals>` inline, so growing this type would grow `Value`.
 #[derive(Debug, Clone)]
 pub struct Signals {
-    signals: Option<Arc<AtomicBool>>,
+    inner: Option<Arc<SignalsInner>>,
+}
+
+#[derive(Debug)]
+struct SignalsInner {
+    primary: Option<Arc<AtomicBool>>,
+    chained: Vec<Arc<AtomicBool>>,
 }
 
 impl Signals {
     /// A [`Signals`] that is not hooked up to any event/signals source.
     ///
     /// So, this [`Signals`] will never be interrupted.
-    pub const EMPTY: Self = Signals { signals: None };
+    pub const EMPTY: Self = Signals { inner: None };
 
     /// Create a new [`Signals`] with `ctrlc` as the interrupt source.
     ///
@@ -26,7 +39,10 @@ impl Signals {
     /// and [`interrupted`](Self::interrupted) will return `true`.
     pub fn new(ctrlc: Arc<AtomicBool>) -> Self {
         Self {
-            signals: Some(ctrlc),
+            inner: Some(Arc::new(SignalsInner {
+                primary: Some(ctrlc),
+                chained: Vec::new(),
+            })),
         }
     }
 
@@ -38,6 +54,26 @@ impl Signals {
     /// already has an underlying [`Signals`].
     pub const fn empty() -> Self {
         Self::EMPTY
+    }
+
+    /// Returns a [`Signals`] that observes `parent` and `local` together.
+    ///
+    /// [`interrupted`](Self::interrupted) returns `true` if either source is
+    /// triggered. [`trigger`](Self::trigger) writes only to `local`, never to
+    /// `parent` -- so a scope can cancel itself without cascading into the
+    /// engine-wide Ctrl-C state.
+    pub fn chain(parent: Signals, local: Arc<AtomicBool>) -> Signals {
+        let (primary, mut chained) = match parent.inner {
+            Some(inner) => {
+                let SignalsInner { primary, chained } = (*inner).clone_fields();
+                (primary, chained)
+            }
+            None => (None, Vec::new()),
+        };
+        chained.push(local);
+        Signals {
+            inner: Some(Arc::new(SignalsInner { primary, chained })),
+        }
     }
 
     /// Returns an `Err` if an interrupt has been triggered.
@@ -59,27 +95,57 @@ impl Signals {
     }
 
     /// Triggers an interrupt.
+    ///
+    /// If this `Signals` was created via [`Signals::chain`], only the most
+    /// recently chained local flag is written to; the parent flag is left
+    /// untouched. This prevents a scoped cancellation from cascading into the
+    /// engine-wide Ctrl-C state.
     pub fn trigger(&self) {
-        if let Some(signals) = &self.signals {
-            signals.store(true, Ordering::Relaxed);
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if let Some(local) = inner.chained.last() {
+            local.store(true, Ordering::Relaxed);
+        } else if let Some(primary) = &inner.primary {
+            primary.store(true, Ordering::Relaxed);
         }
     }
 
     /// Returns whether an interrupt has been triggered.
     #[inline]
     pub fn interrupted(&self) -> bool {
-        self.signals
+        let Some(inner) = &self.inner else {
+            return false;
+        };
+        inner
+            .primary
             .as_deref()
             .is_some_and(|b| b.load(Ordering::Relaxed))
+            || inner.chained.iter().any(|b| b.load(Ordering::Relaxed))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.signals.is_none()
+        self.inner.is_none()
     }
 
     pub fn reset(&self) {
-        if let Some(signals) = &self.signals {
-            signals.store(false, Ordering::Relaxed);
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if let Some(primary) = &inner.primary {
+            primary.store(false, Ordering::Relaxed);
+        }
+        for local in &inner.chained {
+            local.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+impl SignalsInner {
+    fn clone_fields(&self) -> Self {
+        SignalsInner {
+            primary: self.primary.clone(),
+            chained: self.chained.clone(),
         }
     }
 }
