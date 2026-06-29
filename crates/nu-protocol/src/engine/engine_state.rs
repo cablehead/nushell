@@ -98,7 +98,13 @@ pub struct EngineState {
     pub(super) modules: Arc<Vec<Arc<Module>>>,
     pub spans: Vec<Span>,
     doccomments: Doccomments,
-    pub scope: ScopeFrame,
+    /// Wrapped in `Arc` so cloning an `EngineState` (e.g. per `job spawn`, or
+    /// any host running concurrent evals) shares the overlay symbol tables
+    /// instead of deep-copying their name-keyed HashMaps. `scope` is read-only
+    /// during eval; it is mutated only in `merge_delta` and
+    /// `cleanup_stack_variables`, which take `Arc::make_mut` (copy-on-write,
+    /// same pattern as `decls`/`blocks`/`modules`).
+    pub scope: Arc<ScopeFrame>,
     signals: Signals,
     pub signal_handlers: Option<Handlers>,
     pub env_vars: Arc<EnvVars>,
@@ -184,11 +190,11 @@ impl EngineState {
             spans: vec![Span::unknown()],
             doccomments: Doccomments::new(),
             // make sure we have some default overlay:
-            scope: ScopeFrame::with_empty_overlay(
+            scope: Arc::new(ScopeFrame::with_empty_overlay(
                 DEFAULT_OVERLAY_NAME.as_bytes().to_vec(),
                 ModuleId::new(0),
                 false,
-            ),
+            )),
             signal_handlers: None,
             signals: Signals::empty(),
             env_vars: Arc::new(
@@ -279,30 +285,35 @@ impl EngineState {
 
         let first = delta.scope.remove(0);
 
-        for (delta_name, delta_overlay) in first.clone().overlays {
-            if let Some((_, existing_overlay)) = self
-                .scope
-                .overlays
-                .iter_mut()
-                .find(|(name, _)| name == &delta_name)
-            {
-                // Updating existing overlay
-                for item in delta_overlay.decls.into_iter() {
-                    existing_overlay.decls.insert(item.0, item.1);
-                }
-                for item in delta_overlay.vars.into_iter() {
-                    existing_overlay.insert_variable(item.0, item.1);
-                }
-                for item in delta_overlay.modules.into_iter() {
-                    existing_overlay.modules.insert(item.0, item.1);
-                }
+        {
+            // Copy-on-write: clone the overlay tables only if this scope is
+            // shared (e.g. a concurrent engine clone exists). On the main
+            // engine the refcount is 1 here, so this is just a check.
+            let scope = Arc::make_mut(&mut self.scope);
+            for (delta_name, delta_overlay) in first.clone().overlays {
+                if let Some((_, existing_overlay)) = scope
+                    .overlays
+                    .iter_mut()
+                    .find(|(name, _)| name == &delta_name)
+                {
+                    // Updating existing overlay
+                    for item in delta_overlay.decls.into_iter() {
+                        existing_overlay.decls.insert(item.0, item.1);
+                    }
+                    for item in delta_overlay.vars.into_iter() {
+                        existing_overlay.insert_variable(item.0, item.1);
+                    }
+                    for item in delta_overlay.modules.into_iter() {
+                        existing_overlay.modules.insert(item.0, item.1);
+                    }
 
-                existing_overlay
-                    .visibility
-                    .merge_with(delta_overlay.visibility);
-            } else {
-                // New overlay was added to the delta
-                self.scope.overlays.push((delta_name, delta_overlay));
+                    existing_overlay
+                        .visibility
+                        .merge_with(delta_overlay.visibility);
+                } else {
+                    // New overlay was added to the delta
+                    scope.overlays.push((delta_name, delta_overlay));
+                }
             }
         }
 
@@ -316,16 +327,15 @@ impl EngineState {
             }
         }
 
-        // Remove overlays removed in delta
-        self.scope
-            .active_overlays
-            .retain(|id| !removed_ids.contains(id));
-
-        // Move overlays activated in the delta to be first
-        self.scope
+        // Remove overlays removed in delta, then move overlays activated in the
+        // delta to be first. Already unique from the make_mut above (the &self
+        // calls between do not clone scope), so this make_mut never clones.
+        let scope = Arc::make_mut(&mut self.scope);
+        scope.active_overlays.retain(|id| !removed_ids.contains(id));
+        scope
             .active_overlays
             .retain(|id| !activated_ids.contains(id));
-        self.scope.active_overlays.append(&mut activated_ids);
+        scope.active_overlays.append(&mut activated_ids);
 
         #[cfg(feature = "plugin")]
         if !delta.plugins.is_empty() {
@@ -395,7 +405,7 @@ impl EngineState {
     /// This removes variables that are no longer referenced by any overlay or alias.
     pub fn cleanup_stack_variables(&mut self, stack: &mut Stack) {
         let mut shadowed_vars = HashSet::new();
-        for (_, frame) in self.scope.overlays.iter_mut() {
+        for (_, frame) in Arc::make_mut(&mut self.scope).overlays.iter_mut() {
             shadowed_vars.extend(frame.shadowed_vars.drain(..));
         }
 

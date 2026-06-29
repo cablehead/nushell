@@ -325,11 +325,14 @@ pub(crate) fn evaluate_source(
     let pipeline_data = pipeline.body;
 
     // Update engine_state with deleted variables
-    for var_id in &stack.deletions {
-        if let Some(active_id) = engine_state.scope.active_overlays.last()
-            && let Some((_, overlay)) = engine_state.scope.overlays.get_mut((*active_id).get())
+    if !stack.deletions.is_empty() {
+        let scope = std::sync::Arc::make_mut(&mut engine_state.scope);
+        if let Some(active_id) = scope.active_overlays.last().copied()
+            && let Some((_, overlay)) = scope.overlays.get_mut(active_id.get())
         {
-            overlay.vars.retain(|_, v| *v != *var_id);
+            for var_id in &stack.deletions {
+                overlay.vars.retain(|_, v| *v != *var_id);
+            }
         }
     }
     stack.deletions.clear();
