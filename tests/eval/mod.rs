@@ -543,6 +543,94 @@ fn early_return_in_module_export_env_does_not_abort_caller() -> Result {
     )
 }
 
+// ===================================================================================
+// Control-flow signals through `finally`: behavior matrix
+//
+// A control-flow signal (`return`, `break`, `continue`) that leaves a block should run any
+// pending `finally` blocks on the way out, and then keep leaving: it must not run the code
+// that sits after the `try`/`finally`, and it must not be swallowed.
+//
+// Markers printed by each case: F = finally ran, C = catch ran, A = code-after-the-try ran,
+// I/O = inner/outer finally, D = code after a loop ran. Trailing letter(s) = the value the
+// command returned. So "FV" means: finally ran, then the command returned "V".
+//
+//   # | case                                   | main (current) | expected | status
+//  ---+----------------------------------------+----------------+----------+--------
+//   1 | return, try/finally, code after        | FAV            | FV       | BUG: `A` runs
+//   2 | return, try/catch/finally, code after  | FAV            | FV       | BUG: `A` runs
+//   3 | return, try/catch, code after          | V              | V        | ok (guard)
+//   4 | return, try/finally, in tail position  | FV             | FV       | ok (guard)
+//   5 | return, nested finally, code after     | IOAV           | IOV      | BUG: `A` runs
+//   6 | break, loop + try/finally              | D              | FD       | BUG: finally skipped
+//   7 | continue, loop + try/finally           | D              | FFD      | BUG: finally skipped
+//
+// The `main (current)` column was confirmed by running each case on the base commit. Cases
+// 1, 2, 5, 6 and 7 are currently wrong; they are marked `#[ignore]` until the finally rework
+// lands, at which point the ignore is removed and the assertion holds.
+
+#[test]
+#[ignore = "BUG (matrix #1): `return` through a finally still runs the code after the try"]
+fn finally_return_skips_code_after() {
+    test_eval(
+        r#"def foo [] { try { return "V" } finally { print -n "F" }; print -n "A"; "T" }; foo | print"#,
+        Eq("FV"),
+    )
+}
+
+#[test]
+#[ignore = "BUG (matrix #2): `return` through catch+finally still runs the code after the try"]
+fn finally_return_with_catch_skips_code_after() {
+    test_eval(
+        r#"def foo [] { try { return "V" } catch { print -n "C" } finally { print -n "F" }; print -n "A"; "T" }; foo | print"#,
+        Eq("FV"),
+    )
+}
+
+#[test]
+fn return_with_catch_no_finally_skips_code_after() {
+    // guard: without a finally, `return` already skips the code after the try.
+    test_eval(
+        r#"def foo [] { try { return "V" } catch { print -n "C" }; print -n "A"; "T" }; foo | print"#,
+        Eq("V"),
+    )
+}
+
+#[test]
+fn finally_return_in_tail_runs_finally() {
+    // guard: the common case, `return` last in the body, keeps working.
+    test_eval(
+        r#"def foo [] { try { return "V" } finally { print -n "F" } }; foo | print"#,
+        Eq("FV"),
+    )
+}
+
+#[test]
+#[ignore = "BUG (matrix #5): `return` through nested finallys still runs the code after the try"]
+fn finally_return_runs_nested_finallys_then_skips_code_after() {
+    test_eval(
+        r#"def foo [] { try { try { return "V" } finally { print -n "I" } } finally { print -n "O" }; print -n "A"; "T" }; foo | print"#,
+        Eq("IOV"),
+    )
+}
+
+#[test]
+#[ignore = "BUG (matrix #6): `break` skips a pending finally"]
+fn finally_runs_on_break() {
+    test_eval(
+        r#"for x in [1] { try { break } finally { print -n "F" } }; print -n "D""#,
+        Eq("FD"),
+    )
+}
+
+#[test]
+#[ignore = "BUG (matrix #7): `continue` skips a pending finally"]
+fn finally_runs_on_continue() {
+    test_eval(
+        r#"for x in [1 2] { try { continue } finally { print -n "F" } }; print -n "D""#,
+        Eq("FFD"),
+    )
+}
+
 #[test]
 fn try_no_catch() {
     test_eval("try { error make { msg: foo } }; 'pass'", Eq("pass"))
