@@ -577,11 +577,13 @@ fn early_return_in_module_export_env_does_not_abort_caller() -> Result {
 //   9  finally errors, over a pending return  (guard)   want the finally's error
 //      def foo [] { try { return 5 } finally { error make { msg: "from finally" } } }; foo
 //
-// The `main` columns were confirmed by running each case on the base commit. Cases 1, 2, 5, 6
-// and 7 are wrong today and are marked `#[ignore]` until the finally rework lands.
+// The `main` columns were confirmed by running each case on the base commit. Cases 1, 2 and 5
+// (return through a finally) are fixed by the `run-finally` rework in this change. Cases 6 and 7
+// (break/continue through a finally) are a separate, compiler-level fix and stay `#[ignore]`
+// for a follow-up: unlike `return`, they compile to a direct jump out of the loop, so routing
+// them through a pending finally is a change in `compile/keyword.rs`, not the eval loop.
 
 #[test]
-#[ignore = "BUG (matrix #1): `return` through a finally still runs the code after the try"]
 fn finally_return_skips_code_after() {
     test_eval(
         r#"def foo [] { try { return "V" } finally { print -n "F" }; print -n "A"; "T" }; foo | print"#,
@@ -590,7 +592,6 @@ fn finally_return_skips_code_after() {
 }
 
 #[test]
-#[ignore = "BUG (matrix #2): `return` through catch+finally still runs the code after the try"]
 fn finally_return_with_catch_skips_code_after() {
     test_eval(
         r#"def foo [] { try { return "V" } catch { print -n "C" } finally { print -n "F" }; print -n "A"; "T" }; foo | print"#,
@@ -617,7 +618,6 @@ fn finally_return_in_tail_runs_finally() {
 }
 
 #[test]
-#[ignore = "BUG (matrix #5): `return` through nested finallys still runs the code after the try"]
 fn finally_return_runs_nested_finallys_then_skips_code_after() {
     test_eval(
         r#"def foo [] { try { try { return "V" } finally { print -n "I" } } finally { print -n "O" }; print -n "A"; "T" }; foo | print"#,

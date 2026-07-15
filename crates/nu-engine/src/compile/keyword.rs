@@ -716,6 +716,10 @@ pub(crate) fn compile_try(
             }
             .into_spanned(call.head),
         )?;
+        // Marks the end of the `finally` block. On the success path this is a no-op; when a
+        // bail-out (`return`/error/exit) is pending, it resumes that bail-out instead of falling
+        // through into the code after the `try`.
+        builder.push(Instruction::RunFinally.into_spanned(call.head))?;
     }
 
     Ok(())
