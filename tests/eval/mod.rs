@@ -546,27 +546,39 @@ fn early_return_in_module_export_env_does_not_abort_caller() -> Result {
 // ===================================================================================
 // Control-flow signals through `finally`: behavior matrix
 //
-// A control-flow signal (`return`, `break`, `continue`) that leaves a block should run any
-// pending `finally` blocks on the way out, and then keep leaving: it must not run the code
-// that sits after the `try`/`finally`, and it must not be swallowed.
+// Markers printed by each case: F = finally ran, I/O = inner/outer finally, C = catch ran,
+// A = code after the try ran, D = code after a loop ran. Trailing letter(s) = the returned
+// value. So "FV" means: finally ran, then the command returned "V".
 //
-// Markers printed by each case: F = finally ran, C = catch ran, A = code-after-the-try ran,
-// I/O = inner/outer finally, D = code after a loop ran. Trailing letter(s) = the value the
-// command returned. So "FV" means: finally ran, then the command returned "V".
+// Group A: a signal in the `try` (return / break / continue) should run any pending `finally`
+// on the way out, then keep leaving. It must not run the code after the try/finally, and it
+// must not be swallowed.
 //
-//   # | case                                   | main (current) | expected | status
-//  ---+----------------------------------------+----------------+----------+--------
-//   1 | return, try/finally, code after        | FAV            | FV       | BUG: `A` runs
-//   2 | return, try/catch/finally, code after  | FAV            | FV       | BUG: `A` runs
-//   3 | return, try/catch, code after          | V              | V        | ok (guard)
-//   4 | return, try/finally, in tail position  | FV             | FV       | ok (guard)
-//   5 | return, nested finally, code after     | IOAV           | IOV      | BUG: `A` runs
-//   6 | break, loop + try/finally              | D              | FD       | BUG: finally skipped
-//   7 | continue, loop + try/finally           | D              | FFD      | BUG: finally skipped
+//   1  return, try/finally, code after           main FAV   want FV    BUG: A runs
+//      def foo [] { try { return "V" } finally { print -n "F" }; print -n "A"; "T" }; foo
+//   2  return, try/catch/finally, code after      main FAV   want FV    BUG: A runs
+//      def foo [] { try { return "V" } catch { print -n "C" } finally { print -n "F" }; print -n "A"; "T" }; foo
+//   3  return, try/catch, code after   (guard)     main V     want V     ok
+//      def foo [] { try { return "V" } catch { print -n "C" }; print -n "A"; "T" }; foo
+//   4  return, try/finally, tail       (guard)     main FV    want FV    ok
+//      def foo [] { try { return "V" } finally { print -n "F" } }; foo
+//   5  return, nested finally, code after          main IOAV  want IOV   BUG: A runs
+//      def foo [] { try { try { return "V" } finally { print -n "I" } } finally { print -n "O" }; print -n "A"; "T" }; foo
+//   6  break, loop + try/finally                   main D     want FD    BUG: finally skipped
+//      for x in [1] { try { break } finally { print -n "F" } }; print -n "D"
+//   7  continue, loop + try/finally                main D     want FFD   BUG: finally skipped
+//      for x in [1 2] { try { continue } finally { print -n "F" } }; print -n "D"
 //
-// The `main (current)` column was confirmed by running each case on the base commit. Cases
-// 1, 2, 5, 6 and 7 are currently wrong; they are marked `#[ignore]` until the finally rework
-// lands, at which point the ignore is removed and the assertion holds.
+// Group B: when the `finally` itself bails out, its own signal overrides whatever the `try`
+// left pending. This already works and is unchanged by the rework; the guards lock it in.
+//
+//   8  finally returns, over a pending return (guard)   want 7
+//      def foo [] { try { return 5 } finally { return 7 } }; foo
+//   9  finally errors, over a pending return  (guard)   want the finally's error
+//      def foo [] { try { return 5 } finally { error make { msg: "from finally" } } }; foo
+//
+// The `main` columns were confirmed by running each case on the base commit. Cases 1, 2, 5, 6
+// and 7 are wrong today and are marked `#[ignore]` until the finally rework lands.
 
 #[test]
 #[ignore = "BUG (matrix #1): `return` through a finally still runs the code after the try"]
@@ -628,6 +640,24 @@ fn finally_runs_on_continue() {
     test_eval(
         r#"for x in [1 2] { try { continue } finally { print -n "F" } }; print -n "D""#,
         Eq("FFD"),
+    )
+}
+
+#[test]
+fn finally_return_overrides_pending_return() {
+    // 8 (guard): a `return` in the finally wins over a `return` pending from the try.
+    test_eval(
+        r#"def foo [] { try { return 5 } finally { return 7 } }; foo"#,
+        Eq("7"),
+    )
+}
+
+#[test]
+fn finally_error_overrides_pending_return() {
+    // 9 (guard): an error in the finally wins over a `return` pending from the try.
+    test_eval(
+        r#"def foo [] { try { return 5 } finally { error make { msg: "from finally" } } }; foo"#,
+        Error("from finally"),
     )
 }
 
