@@ -450,7 +450,8 @@ enum InstructionResult {
     PopFinally,
     /// End of an inline `finally` block (the `run-finally` instruction). On the success path this
     /// is a no-op; while a bail-out is pending it resumes it, running the next enclosing `finally`
-    /// or leaving the block with the pending value.
+    /// or leaving the block with the pending value. A `return` that leaves this way keeps its
+    /// early-return flag, so it still reads as a `return` at the current level.
     RunFinally,
 }
 
