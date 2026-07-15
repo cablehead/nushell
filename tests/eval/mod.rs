@@ -647,7 +647,7 @@ fn finally_runs_on_continue() {
 fn finally_return_overrides_pending_return() {
     // 8 (guard): a `return` in the finally wins over a `return` pending from the try.
     test_eval(
-        r#"def foo [] { try { return 5 } finally { return 7 } }; foo"#,
+        "def foo [] { try { return 5 } finally { return 7 } }; foo",
         Eq("7"),
     )
 }
