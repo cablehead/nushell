@@ -266,6 +266,10 @@ pub enum Instruction {
     PopErrorHandler,
     /// Pop an finally handler.
     PopFinallyRun,
+    /// Marks the end of an inline `finally` block. On the normal (success) path this is a no-op.
+    /// When a bail-out (`return`/error/exit) is pending, it resumes that bail-out: it runs the
+    /// next enclosing `finally`, or leaves the block with the pending value once none remain.
+    RunFinally,
     /// Return early from the block with the value in the register.
     ///
     /// Unlike `return`, this runs pending `finally` handlers first (collecting the value in that
@@ -349,6 +353,7 @@ impl Instruction {
             Instruction::FinallyInto { .. } => None,
             Instruction::PopErrorHandler => None,
             Instruction::PopFinallyRun => None,
+            Instruction::RunFinally => None,
             Instruction::ReturnEarly { .. } => None,
             Instruction::Return { .. } => None,
         }

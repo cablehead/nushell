@@ -268,6 +268,9 @@ impl fmt::Display for FmtInstruction<'_> {
             Instruction::PopFinallyRun => {
                 write!(f, "{:WIDTH$}", "pop-finally")
             }
+            Instruction::RunFinally => {
+                write!(f, "{:WIDTH$}", "run-finally")
+            }
             Instruction::ReturnEarly { src } => {
                 write!(f, "{:WIDTH$} {src}", "return-early")
             }

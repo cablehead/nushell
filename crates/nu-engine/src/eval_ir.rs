@@ -305,6 +305,33 @@ fn eval_ir_block_impl<D: DebugContext>(
                     return Ok(ctx.take_reg(reg_id).with_early_return());
                 }
             }
+            Ok(InstructionResult::PopFinally) => {
+                // On the success path, pop the innermost `finally` handler as usual. While a
+                // bail-out is pending we must not pop: the handler being run was already popped by
+                // the bail-out arm, and the enclosing handlers must survive so `RunFinally` can
+                // resume through them.
+                if ret_val.is_none() {
+                    ctx.stack.finally_run_handlers.pop(ctx.finally_handler_base);
+                }
+                pc += 1;
+            }
+            Ok(InstructionResult::RunFinally) => {
+                // End of an inline `finally`. Nothing to do on the success path. If a bail-out is
+                // pending, resume it: run the next enclosing `finally`, or leave the block with the
+                // pending value once none remain.
+                if ret_val.is_some() {
+                    if let Some(always_run_handler) =
+                        ctx.stack.finally_run_handlers.pop(ctx.finally_handler_base)
+                    {
+                        prepare_error_handler(ctx, always_run_handler, None);
+                        pc = always_run_handler.handler_index;
+                    } else {
+                        return ret_val.take().expect("ret_val was just checked to be Some");
+                    }
+                } else {
+                    pc += 1;
+                }
+            }
             Err(err @ (ShellError::Continue { .. } | ShellError::Break { .. })) => {
                 return Err(err);
             }
@@ -418,6 +445,13 @@ enum InstructionResult {
     /// invocations clear the flag instead, so a `return` in a nested call can't leak out and be
     /// mistaken for a `return` at the current level.
     ReturnEarly(RegId),
+    /// Pop the innermost `finally` handler (the `pop-finally` instruction). While a bail-out is
+    /// pending this is a no-op, so the enclosing handlers survive for the bail-out to resume.
+    PopFinally,
+    /// End of an inline `finally` block (the `run-finally` instruction). On the success path this
+    /// is a no-op; while a bail-out is pending it resumes it, running the next enclosing `finally`
+    /// or leaving the block with the pending value.
+    RunFinally,
 }
 
 /// Perform an instruction
@@ -1054,10 +1088,8 @@ fn eval_instruction<D: DebugContext>(
             ctx.stack.error_handlers.pop(ctx.error_handler_base);
             Ok(Continue)
         }
-        Instruction::PopFinallyRun => {
-            ctx.stack.finally_run_handlers.pop(ctx.finally_handler_base);
-            Ok(Continue)
-        }
+        Instruction::PopFinallyRun => Ok(InstructionResult::PopFinally),
+        Instruction::RunFinally => Ok(InstructionResult::RunFinally),
         Instruction::ReturnEarly { src } => Ok(InstructionResult::ReturnEarly(*src)),
         Instruction::Return { src } => Ok(Return(*src)),
     }
