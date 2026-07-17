@@ -285,6 +285,16 @@ pub enum Instruction {
     /// return. Custom command and closure calls clear that flag; only top-level file evaluation
     /// reads it, to skip `main`.
     ReturnEarly { src: RegId },
+    /// Leave a loop via `break`/`continue`, first running the `finally_count` pending `finally`
+    /// blocks that sit between here and the loop (innermost first), then jumping to `index` (the
+    /// loop's break or continue label). `supersedes` is set when this exit leaves a `finally`, in
+    /// which case it discards a pending `return`/error whose `finally` is currently running; when
+    /// unset (a break/continue local to a loop nested inside a finally) that pending exit is kept.
+    JumpEarly {
+        index: usize,
+        finally_count: usize,
+        supersedes: bool,
+    },
     /// Return from the block with the value in the register
     Return { src: RegId },
 }
@@ -364,6 +374,7 @@ impl Instruction {
             Instruction::PopFinallyRun => None,
             Instruction::RunFinally => None,
             Instruction::ReturnEarly { .. } => None,
+            Instruction::JumpEarly { .. } => None,
             Instruction::Return { .. } => None,
         }
     }
@@ -389,6 +400,7 @@ impl Instruction {
             Instruction::OnErrorInto { index, dst: _ } => Some(*index),
             Instruction::Finally { index } => Some(*index),
             Instruction::FinallyInto { index, dst: _ } => Some(*index),
+            Instruction::JumpEarly { index, .. } => Some(*index),
             _ => None,
         }
     }
@@ -416,6 +428,7 @@ impl Instruction {
             Instruction::OnErrorInto { index, dst: _ } => *index = target_index,
             Instruction::Finally { index } => *index = target_index,
             Instruction::FinallyInto { index, dst: _ } => *index = target_index,
+            Instruction::JumpEarly { index, .. } => *index = target_index,
             _ => return Err(target_index),
         }
         Ok(())

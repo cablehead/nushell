@@ -571,7 +571,7 @@ pub(crate) fn compile_try(
         pushed_error_handler = true;
     };
 
-    builder.begin_try();
+    builder.begin_try(pushed_error_handler, finally_type.is_some());
 
     if let Some(finally_info) = &finally_type {
         if finally_info.var_id.is_some() {
@@ -701,6 +701,7 @@ pub(crate) fn compile_try(
                 .into_spanned(call.head),
             )?;
         }
+        builder.begin_finally();
         compile_block(
             working_set,
             builder,
@@ -709,6 +710,7 @@ pub(crate) fn compile_try(
             Some(io_reg),
             io_reg,
         )?;
+        builder.end_finally()?;
         builder.push(
             Instruction::Move {
                 dst: io_reg,
@@ -1027,19 +1029,7 @@ pub(crate) fn compile_break(
     _input_reg: Option<RegId>,
     io_reg: RegId,
 ) -> Result<(), CompileError> {
-    if !builder.is_in_loop() {
-        return Err(CompileError::NotInALoop {
-            msg: "'break' can only be used inside a loop".to_string(),
-            span: Some(call.head),
-        });
-    }
-    builder.load_empty(io_reg)?;
-    for _ in 0..builder.context_stack.try_block_depth_from_loop() {
-        builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
-    }
-    builder.push_break(call.head)?;
-    builder.add_comment("break");
-    Ok(())
+    compile_loop_exit(builder, call, io_reg, true)
 }
 
 /// Compile a call to `continue`.
@@ -1051,18 +1041,32 @@ pub(crate) fn compile_continue(
     _input_reg: Option<RegId>,
     io_reg: RegId,
 ) -> Result<(), CompileError> {
+    compile_loop_exit(builder, call, io_reg, false)
+}
+
+/// Compile a `break` (`is_break`) or `continue`: leave the enclosing loop, first popping the error
+/// handlers and running the `finally` blocks of every `try` block between here and the loop.
+fn compile_loop_exit(
+    builder: &mut BlockBuilder,
+    call: &Call,
+    io_reg: RegId,
+    is_break: bool,
+) -> Result<(), CompileError> {
+    let keyword = if is_break { "break" } else { "continue" };
     if !builder.is_in_loop() {
         return Err(CompileError::NotInALoop {
-            msg: "'continue' can only be used inside a loop".to_string(),
+            msg: format!("'{keyword}' can only be used inside a loop"),
             span: Some(call.head),
         });
     }
     builder.load_empty(io_reg)?;
-    for _ in 0..builder.context_stack.try_block_depth_from_loop() {
+    for _ in 0..builder.context_stack.error_handler_depth_from_loop() {
         builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
     }
-    builder.push_continue(call.head)?;
-    builder.add_comment("continue");
+    let finally_count = builder.context_stack.finally_depth_from_loop();
+    let supersedes = builder.context_stack.crosses_finally_to_loop();
+    builder.push_loop_exit(is_break, finally_count, supersedes, call.head)?;
+    builder.add_comment(keyword);
     Ok(())
 }
 

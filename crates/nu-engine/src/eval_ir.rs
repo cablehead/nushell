@@ -242,10 +242,10 @@ fn eval_ir_block_impl<D: DebugContext>(
     // Program counter, starts at zero.
     let mut pc = 0;
     let need_backtrace = ctx.engine_state.get_env_var("NU_BACKTRACE").is_some();
-    // The result of an early exit (`return` or an error) that must still run pending `finally`
-    // handlers before it can leave the block. It takes precedence over the register contents at
-    // the terminal `Return` instruction.
-    let mut ret_val: Option<Result<PipelineExecutionData, ShellError>> = None;
+    // The control-flow exit in flight, if any: a `return`/error/`exit` leaving the block, or a
+    // `break`/`continue` jumping to a loop. It runs pending `finally` blocks first, and takes
+    // precedence over the register contents at the terminal `Return`. See [`Bail`].
+    let mut bail: Option<Bail> = None;
 
     while pc < ir_block.instructions.len() {
         let instruction = &ir_block.instructions[pc];
@@ -272,11 +272,12 @@ fn eval_ir_block_impl<D: DebugContext>(
                 pc = next_pc;
             }
             Ok(InstructionResult::Return(reg_id)) => {
-                // need to check if the return value was stashed by an early `return` or an error
-                // that ran a `finally` handler first. If so, we need to respect that value.
-                match ret_val {
-                    Some(res) => return res,
-                    None => return Ok(ctx.take_reg(reg_id)),
+                // If a `finally` ran on the way out for a pending `return`/error/exit, respect that
+                // stashed value; otherwise return the register. (A `break`/`continue` consumes its
+                // own `bail` at `run-finally` before any terminal `Return`.)
+                match bail.take() {
+                    Some(Bail::Leave(res)) => return res,
+                    _ => return Ok(ctx.take_reg(reg_id)),
                 }
             }
             Ok(InstructionResult::ReturnEarly(reg_id)) => {
@@ -292,9 +293,10 @@ fn eval_ir_block_impl<D: DebugContext>(
                     let collected = collect(data, *span, false);
                     #[cfg(not(feature = "os"))]
                     let collected = collect(data, *span);
-                    ret_val = Some(
-                        collected.map(|body| PipelineExecutionData::from(body).with_early_return()),
-                    );
+                    bail =
+                        Some(Bail::Leave(collected.map(|body| {
+                            PipelineExecutionData::from(body).with_early_return()
+                        })));
                     prepare_error_handler(ctx, always_run_handler, None);
                     pc = always_run_handler.handler_index;
                 } else {
@@ -305,31 +307,79 @@ fn eval_ir_block_impl<D: DebugContext>(
                     return Ok(ctx.take_reg(reg_id).with_early_return());
                 }
             }
+            Ok(InstructionResult::JumpEarly {
+                target,
+                finally_count,
+                supersedes,
+            }) => {
+                // `break`/`continue`. Clear any pending exit whose finally is running. If this jump
+                // leaves that finally (`supersedes`), the exit is discarded; otherwise the jump is
+                // local to a loop nested inside the finally, so keep the exit to restore once the
+                // jump reaches its loop.
+                let saved = bail.take().filter(|_| !supersedes).map(Box::new);
+                let handler = if finally_count > 0 {
+                    ctx.stack.finally_run_handlers.pop(ctx.finally_handler_base)
+                } else {
+                    None
+                };
+                if let Some(handler) = handler {
+                    bail = Some(Bail::Jump {
+                        target,
+                        remaining: finally_count - 1,
+                        saved,
+                    });
+                    prepare_error_handler(ctx, handler, None);
+                    pc = handler.handler_index;
+                } else {
+                    // Nothing more to run (count 0, or the stack was shorter than the compiler
+                    // counted): restore the preserved exit, if any, and jump.
+                    bail = saved.map(|b| *b);
+                    pc = target;
+                }
+            }
             Ok(InstructionResult::PopFinally) => {
                 // On the success path, pop the innermost `finally` handler as usual. While a
                 // bail-out is pending we must not pop: the handler being run was already popped by
                 // the bail-out arm, and the enclosing handlers must survive so `RunFinally` can
                 // resume through them.
-                if ret_val.is_none() {
+                if bail.is_none() {
                     ctx.stack.finally_run_handlers.pop(ctx.finally_handler_base);
                 }
                 pc += 1;
             }
             Ok(InstructionResult::RunFinally) => {
-                // End of an inline `finally`. Nothing to do on the success path. If a bail-out is
-                // pending, resume it: run the next enclosing `finally`, or leave the block with the
-                // pending value once none remain.
-                if ret_val.is_some() {
-                    if let Some(always_run_handler) =
-                        ctx.stack.finally_run_handlers.pop(ctx.finally_handler_base)
-                    {
-                        prepare_error_handler(ctx, always_run_handler, None);
-                        pc = always_run_handler.handler_index;
-                    } else {
-                        return ret_val.take().expect("ret_val was just checked to be Some");
+                // End of an inline `finally`. With no `bail` this is the success path: fall through
+                // to the code after the try. Otherwise decide whether another enclosing `finally`
+                // still needs to run for the pending exit. A `Leave` runs them all the way to the
+                // block base; a `Jump` runs only `remaining` more, stopping at its loop.
+                let run_next = match &mut bail {
+                    None => false,
+                    Some(Bail::Leave(_)) => true,
+                    Some(Bail::Jump { remaining, .. }) => {
+                        let more = *remaining > 0;
+                        if more {
+                            *remaining -= 1;
+                        }
+                        more
                     }
+                };
+                let next_handler = run_next
+                    .then(|| ctx.stack.finally_run_handlers.pop(ctx.finally_handler_base))
+                    .flatten();
+                if let Some(handler) = next_handler {
+                    prepare_error_handler(ctx, handler, None);
+                    pc = handler.handler_index;
                 } else {
-                    pc += 1;
+                    // No more finallys to run: perform the exit's terminal action.
+                    match bail.take() {
+                        None => pc += 1,
+                        Some(Bail::Leave(res)) => return res,
+                        Some(Bail::Jump { target, saved, .. }) => {
+                            // Restore the exit this jump ran inside but did not supersede.
+                            bail = saved.map(|b| *b);
+                            pc = target;
+                        }
+                    }
                 }
             }
             Err(err @ (ShellError::Continue { .. } | ShellError::Break { .. })) => {
@@ -343,7 +393,7 @@ fn eval_ir_block_impl<D: DebugContext>(
                     // and record the exit error firstly.
                     prepare_error_handler(ctx, always_run_handler, None);
                     pc = always_run_handler.handler_index;
-                    ret_val = Some(Err(err));
+                    bail = Some(Bail::Leave(Err(err)));
                 } else {
                     // These block control related errors should be passed through
                     return Err(err);
@@ -379,7 +429,7 @@ fn eval_ir_block_impl<D: DebugContext>(
                         Some(err.clone().into_spanned(*span)),
                     );
                     pc = always_run_handler.handler_index;
-                    ret_val = Some(Err(err));
+                    bail = Some(Bail::Leave(Err(err)));
                 } else if need_backtrace {
                     let err = ShellError::into_chained(err, *span);
                     return Err(err);
@@ -445,6 +495,14 @@ enum InstructionResult {
     /// invocations clear the flag instead, so a `return` in a nested call can't leak out and be
     /// mistaken for a `return` at the current level.
     ReturnEarly(RegId),
+    /// Leave a loop via `break`/`continue` (the `jump-early` instruction): run `finally_count`
+    /// pending `finally` blocks, then jump to `target` (the loop label). If `supersedes`, discard
+    /// any pending return/error whose `finally` is currently running; otherwise keep it.
+    JumpEarly {
+        target: usize,
+        finally_count: usize,
+        supersedes: bool,
+    },
     /// Pop the innermost `finally` handler (the `pop-finally` instruction). While a bail-out is
     /// pending this is a no-op, so the enclosing handlers survive for the bail-out to resume.
     PopFinally,
@@ -453,6 +511,24 @@ enum InstructionResult {
     /// or leaving the block with the pending value. A `return` that leaves this way keeps its
     /// early-return flag, so it still reads as a `return` at the current level.
     RunFinally,
+}
+
+/// A control-flow exit that must run pending `finally` blocks before it takes effect. One shared
+/// slot holds whichever exit is in flight, and [`Instruction::RunFinally`] dispatches on it after
+/// each `finally` runs. `return`, an error, and `exit` all `Leave` the block; `break`/`continue`
+/// `Jump` to a loop label, and take precedence over a `Leave` whose `finally` they run inside.
+enum Bail {
+    /// `return`, an error, or `exit`: run every pending `finally` to the block base, then leave
+    /// the block with this value/error.
+    Leave(Result<PipelineExecutionData, ShellError>),
+    /// `break`/`continue`: run `remaining` more pending `finally` blocks, then jump to `target`.
+    /// `saved` holds a `Leave` this jump ran inside but did not supersede (a break/continue local to
+    /// a loop nested in a finally); it is restored once the jump reaches its loop.
+    Jump {
+        target: usize,
+        remaining: usize,
+        saved: Option<Box<Bail>>,
+    },
 }
 
 /// Perform an instruction
@@ -1123,6 +1199,15 @@ fn eval_instruction<D: DebugContext>(
         Instruction::PopFinallyRun => Ok(InstructionResult::PopFinally),
         Instruction::RunFinally => Ok(InstructionResult::RunFinally),
         Instruction::ReturnEarly { src } => Ok(InstructionResult::ReturnEarly(*src)),
+        Instruction::JumpEarly {
+            index,
+            finally_count,
+            supersedes,
+        } => Ok(InstructionResult::JumpEarly {
+            target: *index,
+            finally_count: *finally_count,
+            supersedes: *supersedes,
+        }),
         Instruction::Return { src } => Ok(Return(*src)),
     }
 }

@@ -570,26 +570,25 @@ fn early_return_in_module_export_env_does_not_abort_caller() -> Result {
 //    4  return, finally, tail                     [guard]
 //    5  return, nested finallys
 //    6  no signal, finally, code after            [guard]  (the only case where code after runs)
-//    7  break, finally                            [BUG]
-//    8  break, nested finallys                    [BUG]
-//    9  continue, finally                         [BUG]
-//   10  continue, nested finallys                 [BUG]
+//    7  break, finally
+//    8  break, nested finallys
+//    9  continue, finally
+//   10  continue, nested finallys
 //
 // B. The finally itself exits: its exit wins over the try's pending exit.
 //   11  finally returns over a pending return
 //   12  finally errors  over a pending return
-//   13  finally breaks  over a pending return     [BUG]
-//   14  finally continues over a pending return   [BUG]
+//   13  finally breaks  over a pending return
+//   14  finally continues over a pending return
 //
-// An error leaves a try the same way: the finally runs and the error propagates. Standard
-// try/finally, unchanged here. Group B with a pending break or continue depends on 7-10 and is
-// left out until those work.
+// An error leaves a try the same way: the finally runs and the error propagates.
 //
-// This change fixes the return cases (1, 2, 5): they used to run the code after the try. The
-// [BUG] cases (7-10, 13, 14) share one cause: break and continue compile to a direct jump, so they
-// neither run a pending finally (7-10) nor clear a pending return set from inside one (13, 14).
-// Their assertions state the intended result and stay `#[ignore]` until the fix lands in
-// `compile/keyword.rs`.
+// All of these hold. `return`, an error, and `exit` run their finallys via the
+// `return-early`/`run-finally` chain in the eval loop; `break`/`continue` join the same chain via
+// `jump-early` (compile/keyword.rs, eval_ir.rs), running the finallys between them and their loop
+// then jumping. A `break`/`continue` that leaves a finally supersedes a pending return (13, 14
+// return the tail, not the leaked value). One that stays inside the finally, targeting a loop
+// nested in it, is local and keeps the pending return instead (see the local_*_in_finally tests).
 
 /// Run a `finally` scenario in-process and return the record it builds. A step in the snippet
 /// announces itself with `"<name>" | job send 0`; the `drain` command (made available here) empties
@@ -670,7 +669,6 @@ fn finally_and_code_after_both_run_on_success() -> Result {
 }
 
 #[test]
-#[ignore = "BUG (matrix 7): `break` skips a pending finally"]
 #[serial]
 fn finally_runs_on_break() -> Result {
     finally_scenario(
@@ -682,7 +680,6 @@ fn finally_runs_on_break() -> Result {
 }
 
 #[test]
-#[ignore = "BUG (matrix 8): `break` skips nested finallys too"]
 #[serial]
 fn finally_runs_on_break_nested() -> Result {
     finally_scenario(
@@ -694,7 +691,6 @@ fn finally_runs_on_break_nested() -> Result {
 }
 
 #[test]
-#[ignore = "BUG (matrix 9): `continue` skips a pending finally"]
 #[serial]
 fn finally_runs_on_continue() -> Result {
     finally_scenario(
@@ -706,7 +702,6 @@ fn finally_runs_on_continue() -> Result {
 }
 
 #[test]
-#[ignore = "BUG (matrix 10): `continue` skips nested finallys too"]
 #[serial]
 fn finally_runs_on_continue_nested() -> Result {
     finally_scenario(
@@ -742,7 +737,6 @@ fn finally_error_overrides_pending_return() -> Result {
 }
 
 #[test]
-#[ignore = "BUG (matrix 13): `break` in a finally exits the loop but leaks the try's pending return"]
 #[serial]
 fn finally_break_overrides_pending_return() -> Result {
     finally_scenario(
@@ -754,7 +748,6 @@ fn finally_break_overrides_pending_return() -> Result {
 }
 
 #[test]
-#[ignore = "BUG (matrix 14): `continue` in a finally leaks the try's pending return"]
 #[serial]
 fn finally_continue_overrides_pending_return() -> Result {
     finally_scenario(
@@ -763,6 +756,39 @@ fn finally_continue_overrides_pending_return() -> Result {
         { ran: (drain), returned: $returned }"#,
     )
     .expect_value_eq(test_value!({ ran: ["finally", "finally", "after loop"], returned: "tail" }))
+}
+
+// A `break`/`continue` that stays inside the finally (it targets a loop nested in the finally, not
+// an enclosing one) is local: it does not supersede the pending return, which resumes once the
+// finally completes. Contrast 13/14, where the break/continue leaves the finally and wins.
+#[test]
+#[serial]
+fn local_break_in_finally_keeps_pending_return() -> Result {
+    finally_scenario(
+        r#"def foo [] {
+            try { return "returned" } finally { for y in [1] { break }; "finally" | job send 0 }
+            "after try" | job send 0
+            "tail"
+        }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "returned" }))
+}
+
+#[test]
+#[serial]
+fn local_continue_in_finally_keeps_pending_return() -> Result {
+    finally_scenario(
+        r#"def foo [] {
+            try { return "returned" } finally { for y in [1 2] { continue }; "finally" | job send 0 }
+            "after try" | job send 0
+            "tail"
+        }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "returned" }))
 }
 
 #[test]

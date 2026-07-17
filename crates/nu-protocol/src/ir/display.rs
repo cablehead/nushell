@@ -286,6 +286,17 @@ impl fmt::Display for FmtInstruction<'_> {
             Instruction::ReturnEarly { src } => {
                 write!(f, "{:WIDTH$} {src}", "return-early")
             }
+            Instruction::JumpEarly {
+                index,
+                finally_count,
+                supersedes,
+            } => {
+                write!(
+                    f,
+                    "{:WIDTH$} {index}, finally {finally_count}, supersedes {supersedes}",
+                    "jump-early"
+                )
+            }
             Instruction::Return { src } => {
                 write!(f, "{:WIDTH$} {src}", "return")
             }

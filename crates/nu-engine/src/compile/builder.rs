@@ -295,6 +295,7 @@ impl BlockBuilder {
             Instruction::PopFinallyRun => Ok(()),
             Instruction::RunFinally => Ok(()),
             Instruction::ReturnEarly { src } => allocate(&[*src], &[]),
+            Instruction::JumpEarly { .. } => Ok(()),
             Instruction::Return { src } => allocate(&[*src], &[]),
         };
 
@@ -496,28 +497,37 @@ impl BlockBuilder {
         self.context_stack.is_in_loop()
     }
 
-    /// Add a loop breaking jump instruction.
-    pub(crate) fn push_break(&mut self, span: Span) -> Result<(), CompileError> {
+    /// Emit a `jump-early` for `break` (`is_break`) or `continue`: run the `finally_count` pending
+    /// `finally` blocks between here and the loop, then jump to the loop's break or continue label.
+    /// `supersedes` is set when this exit leaves a `finally`, so it discards a pending return/error.
+    pub(crate) fn push_loop_exit(
+        &mut self,
+        is_break: bool,
+        finally_count: usize,
+        supersedes: bool,
+        span: Span,
+    ) -> Result<(), CompileError> {
         let loop_ = self
             .context_stack
             .current_loop()
             .ok_or_else(|| CompileError::NotInALoop {
-                msg: "`break` called from outside of a loop".into(),
+                msg: "loop control used outside of a loop".into(),
                 span: Some(span),
             })?;
-        self.jump(loop_.break_label, span)
-    }
-
-    /// Add a loop continuing jump instruction.
-    pub(crate) fn push_continue(&mut self, span: Span) -> Result<(), CompileError> {
-        let loop_ = self
-            .context_stack
-            .current_loop()
-            .ok_or_else(|| CompileError::NotInALoop {
-                msg: "`continue` called from outside of a loop".into(),
-                span: Some(span),
-            })?;
-        self.jump(loop_.continue_label, span)
+        let index = if is_break {
+            loop_.break_label
+        } else {
+            loop_.continue_label
+        }
+        .0;
+        self.push(
+            Instruction::JumpEarly {
+                index,
+                finally_count,
+                supersedes,
+            }
+            .into_spanned(span),
+        )
     }
 
     /// Pop the loop state. Checks that the loop being ended is the same one that was expected.
@@ -596,15 +606,29 @@ impl BlockBuilder {
         })
     }
 
-    pub(crate) fn begin_try(&mut self) {
-        self.context_stack.push_try();
+    pub(crate) fn begin_try(&mut self, has_error_handler: bool, has_finally: bool) {
+        self.context_stack.push_try(has_error_handler, has_finally);
     }
 
     pub(crate) fn end_try(&mut self) -> Result<(), CompileError> {
         match self.context_stack.pop() {
-            Some(ContextBlock::Try) => Ok(()),
+            Some(ContextBlock::Try { .. }) => Ok(()),
             _ => Err(CompileError::NotInATry {
                 msg: "end_try() called outside of a try block".into(),
+                span: None,
+            }),
+        }
+    }
+
+    pub(crate) fn begin_finally(&mut self) {
+        self.context_stack.push_finally();
+    }
+
+    pub(crate) fn end_finally(&mut self) -> Result<(), CompileError> {
+        match self.context_stack.pop() {
+            Some(ContextBlock::Finally) => Ok(()),
+            _ => Err(CompileError::NotInATry {
+                msg: "end_finally() called outside of a finally block".into(),
                 span: None,
             }),
         }
@@ -622,7 +646,16 @@ pub(crate) struct Loop {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextBlock {
     Loop(Loop),
-    Try,
+    /// A `try` block. Records which runtime handlers it pushed, so a `break`/`continue` leaving the
+    /// enclosing loop knows how many error handlers to pop and how many `finally` blocks to run on
+    /// the way out.
+    Try {
+        has_error_handler: bool,
+        has_finally: bool,
+    },
+    /// The body of a `finally` block. A `break`/`continue` that crosses this to reach its loop is
+    /// leaving the finally, so it supersedes any `return`/error whose finally is running.
+    Finally,
 }
 
 #[derive(Debug, Clone)]
@@ -637,8 +670,15 @@ impl ContextStack {
         self.0.push(ContextBlock::Loop(r#loop));
     }
 
-    pub fn push_try(&mut self) {
-        self.0.push(ContextBlock::Try);
+    pub fn push_try(&mut self, has_error_handler: bool, has_finally: bool) {
+        self.0.push(ContextBlock::Try {
+            has_error_handler,
+            has_finally,
+        });
+    }
+
+    pub fn push_finally(&mut self) {
+        self.0.push(ContextBlock::Finally);
     }
 
     pub fn pop(&mut self) -> Option<ContextBlock> {
@@ -652,12 +692,50 @@ impl ContextStack {
         })
     }
 
-    pub fn try_block_depth_from_loop(&self) -> usize {
+    /// The blocks between here and the nearest enclosing loop, innermost first. A `break`/`continue`
+    /// unwinds these on its way to the loop.
+    fn frames_to_loop(&self) -> impl Iterator<Item = &ContextBlock> + '_ {
         self.0
             .iter()
             .rev()
-            .take_while(|&cb| matches!(cb, ContextBlock::Try))
+            .take_while(|cb| !matches!(cb, ContextBlock::Loop(_)))
+    }
+
+    /// How many error handlers a `break`/`continue` must pop to reach its loop.
+    pub fn error_handler_depth_from_loop(&self) -> usize {
+        self.frames_to_loop()
+            .filter(|cb| {
+                matches!(
+                    cb,
+                    ContextBlock::Try {
+                        has_error_handler: true,
+                        ..
+                    }
+                )
+            })
             .count()
+    }
+
+    /// How many `finally` blocks a `break`/`continue` must run to reach its loop.
+    pub fn finally_depth_from_loop(&self) -> usize {
+        self.frames_to_loop()
+            .filter(|cb| {
+                matches!(
+                    cb,
+                    ContextBlock::Try {
+                        has_finally: true,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// Whether a `break`/`continue` leaves a `finally` block to reach its loop. If so, it supersedes
+    /// any `return`/error whose finally is currently running.
+    pub fn crosses_finally_to_loop(&self) -> bool {
+        self.frames_to_loop()
+            .any(|cb| matches!(cb, ContextBlock::Finally))
     }
 
     pub fn is_in_loop(&self) -> bool {
