@@ -446,6 +446,7 @@ fn early_return_keeps_stream() -> Result {
 }
 
 #[test]
+#[serial]
 fn early_return_with_finally_runs_cleanup_and_keeps_value() -> Result {
     // In-process `print` output isn't captured, so the `finally` block reports through the root
     // job's mailbox (`job send 0`) instead. The recovered message and the returned value confirm
@@ -552,162 +553,216 @@ fn early_return_in_module_export_env_does_not_abort_caller() -> Result {
 //
 // How control flow interacts with `finally`.
 //
-// The rule: leaving a `try` runs its `finally` first, then the exit keeps going. The code
-// after the try/finally does not run, and the exit is not lost. Nested finallys run inner
-// first, then outer. If the finally itself exits, its exit replaces whatever the try was doing.
+// The rule: leaving a `try` runs its `finally` first, then the exit keeps going. The code after
+// the try/finally does not run, and the exit is not lost. Nested finallys run inner first, then
+// outer. If the finally itself exits, its exit replaces whatever the try was doing.
 //
-// Trace letters, printed in order: F/I/O a finally ran (I inner, O outer); A the code after
-// the try ran; C a catch ran; D the code after a loop ran. The final letter is the value the
-// function returned.
+// Each case runs in-process via `finally_scenario`. A step of interest announces itself with
+// `"<name>" | job send 0`; the scenario drains those into an ordered `ran` list and reports
+// `{ ran, returned }` (or `{ ran, errored }` when the outcome is an error). So `ran` shows which
+// steps ran and in what order, and `returned` shows the value that came out. Each test's expected
+// record is the source of truth; the list below is a map.
 //
 // A. A signal leaves the try: the finally runs, the signal keeps going, code after is skipped.
-//    1  return, finally, code after                   FV
-//    2  return, catch + finally, code after            FV
-//    3  return, catch, no finally           [guard]     V     (return already skips code after)
-//    4  return, finally, tail               [guard]    FV     (the everyday case)
-//    5  return, nested finallys                        IOV
-//    6  no signal, finally, code after      [guard]    FAT    (the only case where code after runs)
-//    7  break, finally                      [BUG]      FD     (now D: break skips the finally)
-//    8  break, nested finallys              [BUG]      IOD
-//    9  continue, finally                   [BUG]      FFD    (now D: continue skips the finally)
-//   10  continue, nested finallys           [BUG]      IOIOD
+//    1  return, finally, code after
+//    2  return, catch + finally, code after
+//    3  return, catch, no finally                [guard]
+//    4  return, finally, tail                     [guard]
+//    5  return, nested finallys
+//    6  no signal, finally, code after            [guard]  (the only case where code after runs)
+//    7  break, finally                            [BUG]
+//    8  break, nested finallys                    [BUG]
+//    9  continue, finally                         [BUG]
+//   10  continue, nested finallys                 [BUG]
 //
 // B. The finally itself exits: its exit wins over the try's pending exit.
-//   11  finally returns over a pending return          7
-//   12  finally errors  over a pending return          err    (the finally's error, not the return)
-//   13  finally breaks  over a pending return  [BUG]   FDV    (now FDR: the return's value leaks)
-//   14  finally continues over a pending return [BUG]  FFDV   (now FFDR: same leak)
+//   11  finally returns over a pending return
+//   12  finally errors  over a pending return
+//   13  finally breaks  over a pending return     [BUG]
+//   14  finally continues over a pending return   [BUG]
 //
-// An error leaves a try the same way: the finally runs and the error propagates. That is
-// standard try/finally, unchanged here. Group B with a pending break or continue depends on
-// 7-10 and is left out until those work.
+// An error leaves a try the same way: the finally runs and the error propagates. Standard
+// try/finally, unchanged here. Group B with a pending break or continue depends on 7-10 and is
+// left out until those work.
 //
-// This change fixes the return cases: 1, 2 and 5 used to run the code after the try. The break
-// and continue cases (7-10, 13, 14) share one cause: they compile to a direct jump, so they
-// neither run a pending finally nor clear a pending return from inside one. That fix is in
-// `compile/keyword.rs`, left for a follow-up; those cases stay `#[ignore]`.
+// This change fixes the return cases (1, 2, 5): they used to run the code after the try. The
+// [BUG] cases (7-10, 13, 14) share one cause: break and continue compile to a direct jump, so they
+// neither run a pending finally (7-10) nor clear a pending return set from inside one (13, 14).
+// Their assertions state the intended result and stay `#[ignore]` until the fix lands in
+// `compile/keyword.rs`.
 
-#[test]
-fn finally_return_skips_code_after() {
-    test_eval(
-        r#"def foo [] { try { return "V" } finally { print -n "F" }; print -n "A"; "T" }; foo | print"#,
-        Eq("FV"),
-    )
+/// Run a `finally` scenario in-process and return the record it builds. A step in the snippet
+/// announces itself with `"<name>" | job send 0`; the `drain` command (made available here) empties
+/// those from the root job's mailbox into an ordered list, so a scenario ends in, for example,
+/// `{ ran: (drain), returned: $returned }`.
+fn finally_scenario(code: &str) -> Result<Value> {
+    let drain = "def drain [] { mut r = []; loop { let m = (try { job recv --timeout 0sec } catch { break }); $r = ($r | append $m) }; $r }";
+    test().run(format!("{drain}\n{code}"))
 }
 
 #[test]
-fn finally_return_with_catch_skips_code_after() {
-    test_eval(
-        r#"def foo [] { try { return "V" } catch { print -n "C" } finally { print -n "F" }; print -n "A"; "T" }; foo | print"#,
-        Eq("FV"),
+#[serial]
+fn finally_return_skips_code_after() -> Result {
+    finally_scenario(
+        r#"def foo [] { try { return "returned" } finally { "finally" | job send 0 }; "after try" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "returned" }))
 }
 
 #[test]
-fn return_with_catch_no_finally_skips_code_after() {
+#[serial]
+fn finally_return_with_catch_skips_code_after() -> Result {
+    finally_scenario(
+        r#"def foo [] { try { return "returned" } catch { "catch" | job send 0 } finally { "finally" | job send 0 }; "after try" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "returned" }))
+}
+
+#[test]
+#[serial]
+fn return_with_catch_no_finally_skips_code_after() -> Result {
     // guard: without a finally, `return` already skips the code after the try.
-    test_eval(
-        r#"def foo [] { try { return "V" } catch { print -n "C" }; print -n "A"; "T" }; foo | print"#,
-        Eq("V"),
+    finally_scenario(
+        r#"def foo [] { try { return "returned" } catch { "catch" | job send 0 }; "after try" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
     )
+    .expect_value_eq(test_value!({ ran: [], returned: "returned" }))
 }
 
 #[test]
-fn finally_return_in_tail_runs_finally() {
-    // guard: the common case, `return` last in the body, keeps working.
-    test_eval(
-        r#"def foo [] { try { return "V" } finally { print -n "F" } }; foo | print"#,
-        Eq("FV"),
+#[serial]
+fn finally_return_in_tail_runs_finally() -> Result {
+    // guard: the everyday case, `return` last in the body, keeps working.
+    finally_scenario(
+        r#"def foo [] { try { return "returned" } finally { "finally" | job send 0 } }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "returned" }))
 }
 
 #[test]
-fn finally_return_runs_nested_finallys_then_skips_code_after() {
-    test_eval(
-        r#"def foo [] { try { try { return "V" } finally { print -n "I" } } finally { print -n "O" }; print -n "A"; "T" }; foo | print"#,
-        Eq("IOV"),
+#[serial]
+fn finally_return_runs_nested_finallys_then_skips_code_after() -> Result {
+    finally_scenario(
+        r#"def foo [] { try { try { return "returned" } finally { "inner" | job send 0 } } finally { "outer" | job send 0 }; "after try" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["inner", "outer"], returned: "returned" }))
 }
 
 #[test]
-fn finally_and_code_after_both_run_on_success() {
+#[serial]
+fn finally_and_code_after_both_run_on_success() -> Result {
     // 6 (guard): with nothing leaving the try, the finally runs and the code after runs too.
-    test_eval(
-        r#"def foo [] { try { "V" } finally { print -n "F" }; print -n "A"; "T" }; foo | print"#,
-        Eq("FAT"),
+    finally_scenario(
+        r#"def foo [] { try { "body" } finally { "finally" | job send 0 }; "after try" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["finally", "after try"], returned: "tail" }))
 }
 
 #[test]
 #[ignore = "BUG (matrix 7): `break` skips a pending finally"]
-fn finally_runs_on_break() {
-    test_eval(
-        r#"for x in [1] { try { break } finally { print -n "F" } }; print -n "D""#,
-        Eq("FD"),
+#[serial]
+fn finally_runs_on_break() -> Result {
+    finally_scenario(
+        r#"for x in [1] { try { break } finally { "finally" | job send 0 } }
+        "after loop" | job send 0
+        { ran: (drain) }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["finally", "after loop"] }))
 }
 
 #[test]
 #[ignore = "BUG (matrix 8): `break` skips nested finallys too"]
-fn finally_runs_on_break_nested() {
-    test_eval(
-        r#"for x in [1] { try { try { break } finally { print -n "I" } } finally { print -n "O" } }; print -n "D""#,
-        Eq("IOD"),
+#[serial]
+fn finally_runs_on_break_nested() -> Result {
+    finally_scenario(
+        r#"for x in [1] { try { try { break } finally { "inner" | job send 0 } } finally { "outer" | job send 0 } }
+        "after loop" | job send 0
+        { ran: (drain) }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["inner", "outer", "after loop"] }))
 }
 
 #[test]
 #[ignore = "BUG (matrix 9): `continue` skips a pending finally"]
-fn finally_runs_on_continue() {
-    test_eval(
-        r#"for x in [1 2] { try { continue } finally { print -n "F" } }; print -n "D""#,
-        Eq("FFD"),
+#[serial]
+fn finally_runs_on_continue() -> Result {
+    finally_scenario(
+        r#"for x in [1 2] { try { continue } finally { "finally" | job send 0 } }
+        "after loop" | job send 0
+        { ran: (drain) }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["finally", "finally", "after loop"] }))
 }
 
 #[test]
 #[ignore = "BUG (matrix 10): `continue` skips nested finallys too"]
-fn finally_runs_on_continue_nested() {
-    test_eval(
-        r#"for x in [1 2] { try { try { continue } finally { print -n "I" } } finally { print -n "O" } }; print -n "D""#,
-        Eq("IOIOD"),
+#[serial]
+fn finally_runs_on_continue_nested() -> Result {
+    finally_scenario(
+        r#"for x in [1 2] { try { try { continue } finally { "inner" | job send 0 } } finally { "outer" | job send 0 } }
+        "after loop" | job send 0
+        { ran: (drain) }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["inner", "outer", "inner", "outer", "after loop"] }))
 }
 
 #[test]
-fn finally_return_overrides_pending_return() {
+#[serial]
+fn finally_return_overrides_pending_return() -> Result {
     // 11 (guard): a `return` in the finally wins over a `return` pending from the try.
-    test_eval(
-        "def foo [] { try { return 5 } finally { return 7 } }; foo",
-        Eq("7"),
+    finally_scenario(
+        r#"def foo [] { try { return 5 } finally { "finally" | job send 0; return 7 } }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: 7 }))
 }
 
 #[test]
-fn finally_error_overrides_pending_return() {
+#[serial]
+fn finally_error_overrides_pending_return() -> Result {
     // 12 (guard): an error in the finally wins over a `return` pending from the try.
-    test_eval(
-        r#"def foo [] { try { return 5 } finally { error make { msg: "from finally" } } }; foo"#,
-        Error("from finally"),
+    finally_scenario(
+        r#"def foo [] { try { return 5 } finally { "finally" | job send 0; error make { msg: "from finally" } } }
+        let errored = (try { foo; null } catch { |e| $e.msg })
+        { ran: (drain), errored: $errored }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["finally"], errored: "from finally" }))
 }
 
 #[test]
-#[ignore = "BUG (matrix 13): `break` in a finally exits the loop but leaks the try's pending return (FDR, want FDV)"]
-fn finally_break_overrides_pending_return() {
-    test_eval(
-        r#"def foo [] { for x in [1 2] { try { return "R" } finally { print -n "F"; break } }; print -n "D"; "V" }; foo | print"#,
-        Eq("FDV"),
+#[ignore = "BUG (matrix 13): `break` in a finally exits the loop but leaks the try's pending return"]
+#[serial]
+fn finally_break_overrides_pending_return() -> Result {
+    finally_scenario(
+        r#"def foo [] { for x in [1 2] { try { return "returned" } finally { "finally" | job send 0; break } }; "after loop" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["finally", "after loop"], returned: "tail" }))
 }
 
 #[test]
-#[ignore = "BUG (matrix 14): `continue` in a finally leaks the try's pending return (FFDR, want FFDV)"]
-fn finally_continue_overrides_pending_return() {
-    test_eval(
-        r#"def foo [] { for x in [1 2] { try { return "R" } finally { print -n "F"; continue } }; print -n "D"; "V" }; foo | print"#,
-        Eq("FFDV"),
+#[ignore = "BUG (matrix 14): `continue` in a finally leaks the try's pending return"]
+#[serial]
+fn finally_continue_overrides_pending_return() -> Result {
+    finally_scenario(
+        r#"def foo [] { for x in [1 2] { try { return "returned" } finally { "finally" | job send 0; continue } }; "after loop" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
     )
+    .expect_value_eq(test_value!({ ran: ["finally", "finally", "after loop"], returned: "tail" }))
 }
 
 #[test]
