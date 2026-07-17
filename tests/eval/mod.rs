@@ -550,38 +550,42 @@ fn early_return_in_module_export_env_does_not_abort_caller() -> Result {
 // A = code after the try ran, D = code after a loop ran. Trailing letter(s) = the returned
 // value. So "FV" means: finally ran, then the command returned "V".
 //
-// Group A: a signal in the `try` (return / break / continue) should run any pending `finally`
-// on the way out, then keep leaving. It must not run the code after the try/finally, and it
-// must not be swallowed.
+// How control flow interacts with `finally`.
 //
-//   1  return, try/finally, code after           main FAV   want FV    BUG: A runs
-//      def foo [] { try { return "V" } finally { print -n "F" }; print -n "A"; "T" }; foo
-//   2  return, try/catch/finally, code after      main FAV   want FV    BUG: A runs
-//      def foo [] { try { return "V" } catch { print -n "C" } finally { print -n "F" }; print -n "A"; "T" }; foo
-//   3  return, try/catch, code after   (guard)     main V     want V     ok
-//      def foo [] { try { return "V" } catch { print -n "C" }; print -n "A"; "T" }; foo
-//   4  return, try/finally, tail       (guard)     main FV    want FV    ok
-//      def foo [] { try { return "V" } finally { print -n "F" } }; foo
-//   5  return, nested finally, code after          main IOAV  want IOV   BUG: A runs
-//      def foo [] { try { try { return "V" } finally { print -n "I" } } finally { print -n "O" }; print -n "A"; "T" }; foo
-//   6  break, loop + try/finally                   main D     want FD    BUG: finally skipped
-//      for x in [1] { try { break } finally { print -n "F" } }; print -n "D"
-//   7  continue, loop + try/finally                main D     want FFD   BUG: finally skipped
-//      for x in [1 2] { try { continue } finally { print -n "F" } }; print -n "D"
+// The rule: leaving a `try` runs its `finally` first, then the exit keeps going. The code
+// after the try/finally does not run, and the exit is not lost. Nested finallys run inner
+// first, then outer. If the finally itself exits, its exit replaces whatever the try was doing.
 //
-// Group B: when the `finally` itself bails out, its own signal overrides whatever the `try`
-// left pending. This already works and is unchanged by the rework; the guards lock it in.
+// Trace letters, printed in order: F/I/O a finally ran (I inner, O outer); A the code after
+// the try ran; C a catch ran; D the code after a loop ran. The final letter is the value the
+// function returned.
 //
-//   8  finally returns, over a pending return (guard)   want 7
-//      def foo [] { try { return 5 } finally { return 7 } }; foo
-//   9  finally errors, over a pending return  (guard)   want the finally's error
-//      def foo [] { try { return 5 } finally { error make { msg: "from finally" } } }; foo
+// A. A signal leaves the try: the finally runs, the signal keeps going, code after is skipped.
+//    1  return, finally, code after                   FV
+//    2  return, catch + finally, code after            FV
+//    3  return, catch, no finally           [guard]     V     (return already skips code after)
+//    4  return, finally, tail               [guard]    FV     (the everyday case)
+//    5  return, nested finallys                        IOV
+//    6  no signal, finally, code after      [guard]    FAT    (the only case where code after runs)
+//    7  break, finally                      [BUG]      FD     (now D: break skips the finally)
+//    8  break, nested finallys              [BUG]      IOD
+//    9  continue, finally                   [BUG]      FFD    (now D: continue skips the finally)
+//   10  continue, nested finallys           [BUG]      IOIOD
 //
-// The `main` columns were confirmed by running each case on the base commit. Cases 1, 2 and 5
-// (return through a finally) are fixed by the `run-finally` rework in this change. Cases 6 and 7
-// (break/continue through a finally) are a separate, compiler-level fix and stay `#[ignore]`
-// for a follow-up: unlike `return`, they compile to a direct jump out of the loop, so routing
-// them through a pending finally is a change in `compile/keyword.rs`, not the eval loop.
+// B. The finally itself exits: its exit wins over the try's pending exit.
+//   11  finally returns over a pending return          7
+//   12  finally errors  over a pending return          err    (the finally's error, not the return)
+//   13  finally breaks  over a pending return  [BUG]   FDV    (now FDR: the return's value leaks)
+//   14  finally continues over a pending return [BUG]  FFDV   (now FFDR: same leak)
+//
+// An error leaves a try the same way: the finally runs and the error propagates. That is
+// standard try/finally, unchanged here. Group B with a pending break or continue depends on
+// 7-10 and is left out until those work.
+//
+// This change fixes the return cases: 1, 2 and 5 used to run the code after the try. The break
+// and continue cases (7-10, 13, 14) share one cause: they compile to a direct jump, so they
+// neither run a pending finally nor clear a pending return from inside one. That fix is in
+// `compile/keyword.rs`, left for a follow-up; those cases stay `#[ignore]`.
 
 #[test]
 fn finally_return_skips_code_after() {
@@ -626,7 +630,16 @@ fn finally_return_runs_nested_finallys_then_skips_code_after() {
 }
 
 #[test]
-#[ignore = "BUG (matrix #6): `break` skips a pending finally"]
+fn finally_and_code_after_both_run_on_success() {
+    // 6 (guard): with nothing leaving the try, the finally runs and the code after runs too.
+    test_eval(
+        r#"def foo [] { try { "V" } finally { print -n "F" }; print -n "A"; "T" }; foo | print"#,
+        Eq("FAT"),
+    )
+}
+
+#[test]
+#[ignore = "BUG (matrix 7): `break` skips a pending finally"]
 fn finally_runs_on_break() {
     test_eval(
         r#"for x in [1] { try { break } finally { print -n "F" } }; print -n "D""#,
@@ -635,7 +648,16 @@ fn finally_runs_on_break() {
 }
 
 #[test]
-#[ignore = "BUG (matrix #7): `continue` skips a pending finally"]
+#[ignore = "BUG (matrix 8): `break` skips nested finallys too"]
+fn finally_runs_on_break_nested() {
+    test_eval(
+        r#"for x in [1] { try { try { break } finally { print -n "I" } } finally { print -n "O" } }; print -n "D""#,
+        Eq("IOD"),
+    )
+}
+
+#[test]
+#[ignore = "BUG (matrix 9): `continue` skips a pending finally"]
 fn finally_runs_on_continue() {
     test_eval(
         r#"for x in [1 2] { try { continue } finally { print -n "F" } }; print -n "D""#,
@@ -644,8 +666,17 @@ fn finally_runs_on_continue() {
 }
 
 #[test]
+#[ignore = "BUG (matrix 10): `continue` skips nested finallys too"]
+fn finally_runs_on_continue_nested() {
+    test_eval(
+        r#"for x in [1 2] { try { try { continue } finally { print -n "I" } } finally { print -n "O" } }; print -n "D""#,
+        Eq("IOIOD"),
+    )
+}
+
+#[test]
 fn finally_return_overrides_pending_return() {
-    // 8 (guard): a `return` in the finally wins over a `return` pending from the try.
+    // 11 (guard): a `return` in the finally wins over a `return` pending from the try.
     test_eval(
         "def foo [] { try { return 5 } finally { return 7 } }; foo",
         Eq("7"),
@@ -654,10 +685,28 @@ fn finally_return_overrides_pending_return() {
 
 #[test]
 fn finally_error_overrides_pending_return() {
-    // 9 (guard): an error in the finally wins over a `return` pending from the try.
+    // 12 (guard): an error in the finally wins over a `return` pending from the try.
     test_eval(
         r#"def foo [] { try { return 5 } finally { error make { msg: "from finally" } } }; foo"#,
         Error("from finally"),
+    )
+}
+
+#[test]
+#[ignore = "BUG (matrix 13): `break` in a finally exits the loop but leaks the try's pending return (FDR, want FDV)"]
+fn finally_break_overrides_pending_return() {
+    test_eval(
+        r#"def foo [] { for x in [1 2] { try { return "R" } finally { print -n "F"; break } }; print -n "D"; "V" }; foo | print"#,
+        Eq("FDV"),
+    )
+}
+
+#[test]
+#[ignore = "BUG (matrix 14): `continue` in a finally leaks the try's pending return (FFDR, want FFDV)"]
+fn finally_continue_overrides_pending_return() {
+    test_eval(
+        r#"def foo [] { for x in [1 2] { try { return "R" } finally { print -n "F"; continue } }; print -n "D"; "V" }; foo | print"#,
+        Eq("FFDV"),
     )
 }
 
