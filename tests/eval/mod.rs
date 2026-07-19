@@ -936,6 +936,19 @@ fn finally_error_caught_inside_a_nested_finally_keeps_the_outer_return() -> Resu
 }
 
 #[test]
+fn nested_return_abandoned_in_finally_restores_outer_return() -> Result {
+    // Inside the outer `return`'s finally, a nested `return` is itself abandoned (its own finally
+    // throws, caught inside the outer finally, so the outer finally completes normally). The nested
+    // return does not take over, so the outer `return "R1"` survives.
+    test_eval(
+        r#"def foo [] { try { return "R1" } finally { try { try { return "R2" } finally { error make { msg: boom } } } catch {|e| null } } }
+        foo"#,
+        Eq("R1"),
+    );
+    Ok(())
+}
+
+#[test]
 fn try_no_catch() {
     test_eval("try { error make { msg: foo } }; 'pass'", Eq("pass"))
 }

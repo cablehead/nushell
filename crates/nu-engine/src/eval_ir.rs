@@ -285,9 +285,14 @@ fn eval_ir_block_impl<D: DebugContext>(
                 let collected = collect(data, *span, false);
                 #[cfg(not(feature = "os"))]
                 let collected = collect(data, *span);
-                let terminal = Terminal::Leave(
-                    collected.map(|body| PipelineExecutionData::from(body).with_early_return()),
-                );
+                // Carry any outer exit whose finally we are in, so it is restored if this return is
+                // itself abandoned (its finally throws and the error is caught inside that finally).
+                let saved = bail.take().map(Box::new);
+                let terminal = Terminal::Leave {
+                    result: collected
+                        .map(|body| PipelineExecutionData::from(body).with_early_return()),
+                    saved,
+                };
                 match begin_unwind(ctx, &mut bail, finallys, None, false, terminal) {
                     Step::Goto(next_pc) => pc = next_pc,
                     Step::Done(result) => return *result,
@@ -326,9 +331,14 @@ fn eval_ir_block_impl<D: DebugContext>(
             }
             Err(err @ ShellError::Exit { abort: false, .. }) => {
                 // `exit` runs pending `finally` blocks but is not catchable: it skips `catch`
-                // regions and leaves the block with the exit error.
+                // regions and leaves the block with the exit error. Carry any outer exit whose
+                // finally we are in, so it is restored if this exit is itself abandoned.
                 let finallys = covering_finallys(&ir_block.regions, pc, None);
-                let terminal = Terminal::Leave(Err(err));
+                let saved = bail.take().map(Box::new);
+                let terminal = Terminal::Leave {
+                    result: Err(err),
+                    saved,
+                };
                 match begin_unwind(ctx, &mut bail, finallys, None, true, terminal) {
                     Step::Goto(next_pc) => pc = next_pc,
                     Step::Done(result) => return *result,
@@ -493,8 +503,13 @@ struct Bail {
 
 /// What a [`Bail`] does once its `finally` blocks have run.
 enum Terminal {
-    /// `return`, `exit`, or a propagated error: leave the block with this result.
-    Leave(Result<PipelineExecutionData, ShellError>),
+    /// `return`, `exit`, or a propagated error: leave the block with `result`. `saved` is a pending
+    /// exit this one was raised inside (an outer `return`/`exit` whose finally is still running); it
+    /// is dropped once this exit leaves the block, but restored if this exit is itself abandoned.
+    Leave {
+        result: Result<PipelineExecutionData, ShellError>,
+        saved: Option<Box<Bail>>,
+    },
     /// Normal completion, `break`, or `continue`: jump to `target`. `saved` is a pending exit this
     /// jump ran inside but did not supersede (a break/continue local to a loop nested in a finally);
     /// it is restored once control reaches `target`.
@@ -581,7 +596,13 @@ fn plan_error(
             }
         }
     }
-    (finallys, Terminal::Leave(Err(error.item.clone())))
+    (
+        finallys,
+        Terminal::Leave {
+            result: Err(error.item.clone()),
+            saved: None,
+        },
+    )
 }
 
 /// Enter the first pending `finally` and carry the rest plus `terminal` in `bail`; or perform
@@ -630,7 +651,8 @@ fn resume_unwind(
 /// `catch` with the error in its register.
 fn do_terminal(ctx: &mut EvalContext<'_>, bail: &mut Option<Bail>, terminal: Terminal) -> Step {
     match terminal {
-        Terminal::Leave(result) => Step::Done(Box::new(result)),
+        // The exit leaves the block; `saved` (an outer exit it superseded) is discarded.
+        Terminal::Leave { result, saved: _ } => Step::Done(Box::new(result)),
         Terminal::Jump { target, saved } => {
             *bail = saved.map(|b| *b);
             Step::Goto(target)
@@ -652,8 +674,9 @@ fn do_terminal(ctx: &mut EvalContext<'_>, bail: &mut Option<Bail>, terminal: Ter
 /// The pending exit a terminal had suspended (a `Jump`/`Catch` `saved`), if any.
 fn suspended(terminal: Terminal) -> Option<Box<Bail>> {
     match terminal {
-        Terminal::Jump { saved, .. } | Terminal::Catch { saved, .. } => saved,
-        Terminal::Leave(_) => None,
+        Terminal::Leave { saved, .. }
+        | Terminal::Jump { saved, .. }
+        | Terminal::Catch { saved, .. } => saved,
     }
 }
 
