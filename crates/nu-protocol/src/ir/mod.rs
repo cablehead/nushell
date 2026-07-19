@@ -285,14 +285,15 @@ pub enum Instruction {
     /// return. Custom command and closure calls clear that flag; only top-level file evaluation
     /// reads it, to skip `main`.
     ReturnEarly { src: RegId },
-    /// Leave a loop via `break`/`continue`, first running the `finally_count` pending `finally`
-    /// blocks that sit between here and the loop (innermost first), then jumping to `index` (the
-    /// loop's break or continue label). `supersedes` is set when this exit leaves a `finally`, in
-    /// which case it discards a pending `return`/error whose `finally` is currently running; when
-    /// unset (a break/continue local to a loop nested inside a finally) that pending exit is kept.
+    /// Leave a loop via `break`/`continue`, unwinding the `handler_count` `catch`/`finally`
+    /// handlers that sit between here and the loop (innermost first): each pending `finally` runs,
+    /// each `catch` is discarded, then control jumps to `index` (the loop's break or continue
+    /// label). `supersedes` is set when this exit leaves a `finally`, in which case it discards a
+    /// pending `return`/error whose `finally` is currently running; when unset (a break/continue
+    /// local to a loop nested inside a finally) that pending exit is kept.
     JumpEarly {
         index: usize,
-        finally_count: usize,
+        handler_count: usize,
         supersedes: bool,
     },
     /// Return from the block with the value in the register

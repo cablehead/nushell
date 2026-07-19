@@ -581,14 +581,16 @@ fn early_return_in_module_export_env_does_not_abort_caller() -> Result {
 //   13  finally breaks  over a pending return
 //   14  finally continues over a pending return
 //
-// An error leaves a try the same way: the finally runs and the error propagates.
+// An error leaves a try the same way: the finally runs and the error propagates (and an enclosing
+// `catch` may intercept it after the inner finallys run; see the enclosing-catch tests below).
 //
-// All of these hold. `return`, an error, and `exit` run their finallys via the
-// `return-early`/`run-finally` chain in the eval loop; `break`/`continue` join the same chain via
-// `jump-early` (compile/keyword.rs, eval_ir.rs), running the finallys between them and their loop
-// then jumping. A `break`/`continue` that leaves a finally supersedes a pending return (13, 14
-// return the tail, not the leaked value). One that stays inside the finally, targeting a loop
-// nested in it, is local and keeps the pending return instead (see the local_*_in_finally tests).
+// All of these hold. Every exit walks one unified `catch`/`finally` handler stack in nesting order
+// (eval_ir.rs): `return`/error/`exit` unwind to the block base via the `run-finally` chain, and
+// `break`/`continue` unwind to their loop via `jump-early` (compile/keyword.rs), running each
+// pending finally and discarding each catch in the way. A `break`/`continue` that leaves a finally
+// supersedes a pending return (13, 14 return the tail, not the leaked value). One that stays inside
+// the finally, targeting a loop nested in it, is local and keeps the pending return instead (see
+// the local_*_in_finally tests).
 
 /// Run a `finally` scenario in-process and return the record it builds. A step in the snippet
 /// announces itself with `"<name>" | job send 0`; the `drain` command (made available here) empties
@@ -789,6 +791,65 @@ fn local_continue_in_finally_keeps_pending_return() -> Result {
         { ran: (drain), returned: $returned }"#,
     )
     .expect_value_eq(test_value!({ ran: ["finally"], returned: "returned" }))
+}
+
+// An error that is caught by an *enclosing* `catch` must still run the `finally` of every inner
+// `try` it unwinds past, in order, before the catch handles it. These cases were wrong before the
+// `catch`/`finally` handler stacks were unified into one walked in nesting order: the enclosing
+// catch was consulted before the inner finally, so the inner finally was skipped.
+
+#[test]
+#[serial]
+fn error_runs_inner_finally_before_outer_catch() -> Result {
+    finally_scenario(
+        r#"let returned = (try { try { error make { msg: "a" } } finally { "finally" | job send 0 } } catch { |e| $e.msg })
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "a" }))
+}
+
+#[test]
+#[serial]
+fn catch_that_throws_runs_inner_finally_before_outer_catch() -> Result {
+    // The inner `catch` throws while an outer `catch` is waiting: the inner `finally` must run
+    // before the outer catch, and the outer catch sees the catch's error.
+    finally_scenario(
+        r#"let returned = (try { try { error make { msg: "a" } } catch { "catch" | job send 0; error make { msg: "b" } } finally { "finally" | job send 0 } } catch { |e| $e.msg })
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["catch", "finally"], returned: "b" }))
+}
+
+#[test]
+#[serial]
+fn error_runs_nested_finallys_before_outer_catch() -> Result {
+    finally_scenario(
+        r#"let returned = (try { try { try { error make { msg: "a" } } finally { "f1" | job send 0 } } finally { "f2" | job send 0 } } catch { |e| $e.msg })
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["f1", "f2"], returned: "a" }))
+}
+
+#[test]
+#[serial]
+fn catch_that_throws_runs_nested_finallys_before_outer_catch() -> Result {
+    finally_scenario(
+        r#"let returned = (try { try { try { error make { msg: "a" } } catch { "c1" | job send 0; error make { msg: "b" } } finally { "f1" | job send 0 } } finally { "f2" | job send 0 } } catch { |e| $e.msg })
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["c1", "f1", "f2"], returned: "b" }))
+}
+
+#[test]
+#[serial]
+fn break_in_catch_runs_finally() -> Result {
+    // A `break` from inside a `catch` still leaves through that `try`'s `finally`.
+    finally_scenario(
+        r#"for x in [1] { try { error make { msg: "a" } } catch { "catch" | job send 0; break } finally { "finally" | job send 0 } }
+        "after loop" | job send 0
+        { ran: (drain) }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["catch", "finally", "after loop"] }))
 }
 
 #[test]

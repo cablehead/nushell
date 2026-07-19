@@ -288,12 +288,12 @@ impl fmt::Display for FmtInstruction<'_> {
             }
             Instruction::JumpEarly {
                 index,
-                finally_count,
+                handler_count,
                 supersedes,
             } => {
                 write!(
                     f,
-                    "{:WIDTH$} {index}, finally {finally_count}, supersedes {supersedes}",
+                    "{:WIDTH$} {index}, handlers {handler_count}, supersedes {supersedes}",
                     "jump-early"
                 )
             }

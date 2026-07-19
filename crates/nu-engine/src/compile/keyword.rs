@@ -547,32 +547,9 @@ pub(crate) fn compile_try(
         })
         .transpose()?;
 
-    // Put the error handler instruction. If we have a catch expression then we should capture the
-    // error.
-    let mut has_try_comment = false;
-    let mut pushed_error_handler = false;
-    if catch_type.is_some() {
-        builder.push(
-            Instruction::OnErrorInto {
-                index: err_label.0,
-                dst: io_reg,
-            }
-            .into_spanned(call.head),
-        )?;
-        builder.add_comment("try");
-        has_try_comment = true;
-        pushed_error_handler = true;
-    } else if finally_expr.is_none() {
-        // Simply try, without `catch` and `finally` block, need to set up OnErrorHandler.
-        // so `try { 1 / 0 }` works
-        builder.push(Instruction::OnError { index: err_label.0 }.into_spanned(call.head))?;
-        builder.add_comment("try");
-        has_try_comment = true;
-        pushed_error_handler = true;
-    };
-
-    builder.begin_try(pushed_error_handler, finally_type.is_some());
-
+    // Set up the handlers. Push the `finally` handler FIRST, then the `catch`, so on the unified
+    // runtime handler stack the `catch` sits above its own `finally`: a body error reaches the
+    // `catch` first, and the `finally` runs afterward on the way out.
     if let Some(finally_info) = &finally_type {
         if finally_info.var_id.is_some() {
             builder.push(
@@ -585,9 +562,32 @@ pub(crate) fn compile_try(
         } else {
             builder.push(Instruction::Finally { index: end_label.0 }.into_spanned(call.head))?;
         }
-        if !has_try_comment {
+        builder.add_comment("try");
+        builder.begin_pending_finally();
+    }
+
+    let mut pushed_error_handler = false;
+    if catch_type.is_some() {
+        builder.push(
+            Instruction::OnErrorInto {
+                index: err_label.0,
+                dst: io_reg,
+            }
+            .into_spanned(call.head),
+        )?;
+        if finally_type.is_none() {
             builder.add_comment("try");
         }
+        pushed_error_handler = true;
+    } else if finally_expr.is_none() {
+        // Simply try, without `catch` and `finally` block, need to set up an error handler,
+        // so `try { 1 / 0 }` works.
+        builder.push(Instruction::OnError { index: err_label.0 }.into_spanned(call.head))?;
+        builder.add_comment("try");
+        pushed_error_handler = true;
+    }
+    if pushed_error_handler {
+        builder.begin_pending_catch();
     }
 
     // Compile the block
@@ -622,9 +622,8 @@ pub(crate) fn compile_try(
 
     if pushed_error_handler {
         builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
+        builder.end_pending_catch()?;
     }
-
-    builder.end_try()?;
 
     // Jump over the failure case
     builder.jump(end_label, catch_span)?;
@@ -684,6 +683,7 @@ pub(crate) fn compile_try(
     builder.set_label(end_label, builder.here())?;
     if finally_type.is_some() {
         builder.push(Instruction::PopFinallyRun.into_spanned(call.head))?;
+        builder.end_pending_finally()?;
     }
 
     // This is the finally part.
@@ -701,7 +701,7 @@ pub(crate) fn compile_try(
                 .into_spanned(call.head),
             )?;
         }
-        builder.begin_finally();
+        builder.begin_finally_body();
         compile_block(
             working_set,
             builder,
@@ -710,7 +710,7 @@ pub(crate) fn compile_try(
             Some(io_reg),
             io_reg,
         )?;
-        builder.end_finally()?;
+        builder.end_finally_body()?;
         builder.push(
             Instruction::Move {
                 dst: io_reg,
@@ -1044,8 +1044,9 @@ pub(crate) fn compile_continue(
     compile_loop_exit(builder, call, io_reg, false)
 }
 
-/// Compile a `break` (`is_break`) or `continue`: leave the enclosing loop, first popping the error
-/// handlers and running the `finally` blocks of every `try` block between here and the loop.
+/// Compile a `break` (`is_break`) or `continue`: leave the enclosing loop, unwinding the
+/// `catch`/`finally` handlers of every `try` block between here and the loop (running the finallys,
+/// discarding the catches) via a single `jump-early`.
 fn compile_loop_exit(
     builder: &mut BlockBuilder,
     call: &Call,
@@ -1060,12 +1061,9 @@ fn compile_loop_exit(
         });
     }
     builder.load_empty(io_reg)?;
-    for _ in 0..builder.context_stack.error_handler_depth_from_loop() {
-        builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
-    }
-    let finally_count = builder.context_stack.finally_depth_from_loop();
+    let handler_count = builder.context_stack.handler_depth_from_loop();
     let supersedes = builder.context_stack.crosses_finally_to_loop();
-    builder.push_loop_exit(is_break, finally_count, supersedes, call.head)?;
+    builder.push_loop_exit(is_break, handler_count, supersedes, call.head)?;
     builder.add_comment(keyword);
     Ok(())
 }
