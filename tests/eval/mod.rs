@@ -862,8 +862,8 @@ fn finally_error_caught_outside_discards_pending_return() -> Result {
     // The inner `finally` throws, discarding the pending `return 99`; the throw is caught by the
     // outer `catch`, and the return does not re-emerge, so the code after the try runs.
     test_eval(
-        r#"def foo [] { try { try { return 99 } finally { error make { msg: rf } } } catch { null }; 7 }
-        foo"#,
+        "def foo [] { try { try { return 99 } finally { error make { msg: rf } } } catch { null }; 7 }
+        foo",
         Eq("7"),
     );
     Ok(())
@@ -895,6 +895,44 @@ fn finally_error_discards_pending_break() -> Result {
         { ran: (drain) }"#,
     )
     .expect_value_eq(test_value!({ ran: ["i", "c", "f", "i", "c", "f", "after"] }))
+}
+
+#[test]
+#[serial]
+fn finally_error_caught_outside_a_nested_finally_resumes_the_outer_exit_once() -> Result {
+    // A `finally` (running for a pending `return`) contains a nested `try` whose own finally
+    // throws. That error escapes the nested try and is caught alongside it, which discards the
+    // nested try's normal completion but must not replay it: the catch continuation ("after") runs
+    // once, and the outer `return 9` still comes out.
+    finally_scenario(
+        r#"def foo [] {
+            try { return 9 } finally {
+                try { try { "b" | job send 0 } finally { error make { msg: e } } } catch { "c" | job send 0 }
+                "after" | job send 0
+            }
+        }
+        let returned = (foo)
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["b", "c", "after"], returned: 9 }))
+}
+
+#[test]
+#[serial]
+fn finally_error_caught_inside_a_nested_finally_keeps_the_outer_return() -> Result {
+    // The error is caught inside the outer `finally` (by a nested `catch`), so the outer finally
+    // completes normally and the pending `return 3` survives, even though the error ran a nested
+    // `finally` on the way.
+    finally_scenario(
+        r#"def foo [] {
+            try { return 3 } finally {
+                try { try { error make { msg: e } } finally { "if" | job send 0 } } catch { "c" | job send 0 }
+            }
+        }
+        let returned = (foo)
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["if", "c"], returned: 3 }))
 }
 
 #[test]

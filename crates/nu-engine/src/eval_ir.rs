@@ -315,6 +315,7 @@ fn eval_ir_block_impl<D: DebugContext>(
                     finallys,
                     clobber,
                     terminal,
+                    finally: _,
                 }) => match resume_unwind(ctx, &mut bail, finallys, clobber, terminal) {
                     Step::Goto(next_pc) => pc = next_pc,
                     Step::Done(result) => return *result,
@@ -355,12 +356,34 @@ fn eval_ir_block_impl<D: DebugContext>(
                     ctx.engine_state.signals().reset();
                 }
                 if !handled {
-                    // Nothing catches or runs a finally for this error: propagate it.
+                    // Nothing catches or runs a finally for this error: it propagates, abandoning
+                    // any pending exit (its finally completed abruptly).
                     return match need_backtrace {
                         true => Err(ShellError::into_chained(error.item, error.span)),
                         false => Err(error.item),
                     };
                 }
+                // Abandon any pending exit whose finally this error escapes; the survivor (an outer
+                // exit the error is caught inside of) is resumed after the catch runs.
+                let catch_target = match &terminal {
+                    Terminal::Catch { target, .. } => Some(*target),
+                    _ => None,
+                };
+                let saved = reconcile(&mut bail, catch_target);
+                let terminal = match terminal {
+                    Terminal::Catch {
+                        target,
+                        register,
+                        error,
+                        ..
+                    } => Terminal::Catch {
+                        target,
+                        register,
+                        error,
+                        saved,
+                    },
+                    other => other,
+                };
                 let first_error = (!finallys.is_empty()).then(|| error.clone());
                 match begin_unwind(ctx, &mut bail, finallys, first_error, true, terminal) {
                     Step::Goto(next_pc) => pc = next_pc,
@@ -440,11 +463,13 @@ enum InstructionResult {
     EndFinally,
 }
 
-/// A pending `finally` block to run while unwinding: where its body starts, and the register that
-/// receives the error (or is emptied) on entry.
+/// A pending `finally` block to run while unwinding: its body range `[target, end)`, and the
+/// register that receives the error (or is emptied) on entry. The range lets an error raised while
+/// this finally runs tell whether its handler lies inside the finally or escapes it.
 #[derive(Clone, Copy)]
 struct Finally {
     target: usize,
+    end: usize,
     register: Option<RegId>,
 }
 
@@ -460,6 +485,10 @@ struct Bail {
     finallys: Vec<Finally>,
     clobber: bool,
     terminal: Terminal,
+    /// Body range `[start, end)` of the `finally` currently running for this exit. An error raised
+    /// in that finally whose handler falls outside this range escapes the finally, which then
+    /// completes abruptly and abandons this exit (see the error arm's `reconcile`).
+    finally: (usize, usize),
 }
 
 /// What a [`Bail`] does once its `finally` blocks have run.
@@ -473,11 +502,14 @@ enum Terminal {
         target: usize,
         saved: Option<Box<Bail>>,
     },
-    /// An error handled by a `catch`: enter it with the error in its register.
+    /// An error handled by a `catch`: enter it with the error in its register. `saved` is a pending
+    /// exit whose finally still contains this catch (an outer exit the error did not escape); it is
+    /// restored once the catch runs.
     Catch {
         target: usize,
         register: Option<RegId>,
         error: Box<Spanned<ShellError>>,
+        saved: Option<Box<Bail>>,
     },
 }
 
@@ -514,6 +546,7 @@ fn covering_finallys(
         .filter(|r| not_covering.is_none_or(|t| !(r.start <= t && t < r.end)))
         .map(|r| Finally {
             target: r.target,
+            end: r.handler_end,
             register: r.error_register,
         })
         .collect()
@@ -532,6 +565,7 @@ fn plan_error(
         match region.kind {
             RegionKind::Finally => finallys.push(Finally {
                 target: region.target,
+                end: region.handler_end,
                 register: region.error_register,
             }),
             RegionKind::Catch => {
@@ -541,6 +575,7 @@ fn plan_error(
                         target: region.target,
                         register: region.error_register,
                         error: Box::new(error.clone()),
+                        saved: None,
                     },
                 );
             }
@@ -570,6 +605,7 @@ fn begin_unwind(
                 finallys: finallys.collect(),
                 clobber,
                 terminal,
+                finally: (first.target, first.end),
             });
             Step::Goto(first.target)
         }
@@ -603,11 +639,42 @@ fn do_terminal(ctx: &mut EvalContext<'_>, bail: &mut Option<Bail>, terminal: Ter
             target,
             register,
             error,
+            saved,
         } => {
             put_error(ctx, register, Some(&error));
+            // Resume the outer exit this catch runs inside (its finally is still pending).
+            *bail = saved.map(|b| *b);
             Step::Goto(target)
         }
     }
+}
+
+/// The pending exit a terminal had suspended (a `Jump`/`Catch` `saved`), if any.
+fn suspended(terminal: Terminal) -> Option<Box<Bail>> {
+    match terminal {
+        Terminal::Jump { saved, .. } | Terminal::Catch { saved, .. } => saved,
+        Terminal::Leave(_) => None,
+    }
+}
+
+/// When an error is raised while `finally` blocks run, abandon each pending exit whose finally the
+/// error's handler escapes (its finally completes abruptly), restoring whatever that exit had itself
+/// suspended. Returns the surviving pending exit: the innermost one whose finally still contains the
+/// handler, to be resumed after the `catch` runs. `catch_target` is `None` for a propagating error,
+/// which escapes every finally.
+fn reconcile(bail: &mut Option<Bail>, catch_target: Option<usize>) -> Option<Box<Bail>> {
+    loop {
+        let escapes = match bail.as_ref() {
+            None => break,
+            Some(b) => catch_target.is_none_or(|t| !(b.finally.0 <= t && t < b.finally.1)),
+        };
+        if !escapes {
+            break;
+        }
+        let abandoned = bail.take().expect("checked to be Some");
+        *bail = suspended(abandoned.terminal).map(|b| *b);
+    }
+    bail.take().map(Box::new)
 }
 
 /// Perform an instruction

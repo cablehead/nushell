@@ -42,6 +42,10 @@ pub struct TryRegion {
     pub end: usize,
     /// Instruction index of the `catch` or `finally` body this region transfers to.
     pub target: usize,
+    /// One past the last instruction of the `catch`/`finally` body (exclusive). The body occupies
+    /// `[target, handler_end)`, so an error raised while a `finally` runs can tell whether its
+    /// handler lies inside this finally (the pending exit survives) or escapes it (it is abandoned).
+    pub handler_end: usize,
     /// Register that receives the error (or the try/catch value, for a `finally` with a variable)
     /// when control enters the target. `None` when nothing is bound.
     pub error_register: Option<RegId>,

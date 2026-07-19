@@ -598,9 +598,9 @@ pub(crate) fn compile_try(
 
     // The error handler (`catch` body or bare-`try` swallow), out-of-line: reached only via the
     // catch region on an error.
-    let mut catch_target = None;
+    let mut catch_region = None;
     if has_catch {
-        catch_target = Some(builder.here());
+        let catch_target = builder.here();
         // State in the error handler is not well defined; mark the register as not clean.
         builder.mark_register(io_reg)?;
         match &catch_type {
@@ -645,6 +645,7 @@ pub(crate) fn compile_try(
         }
         // Catch completion: run the covering `finally` (if any), then go to END.
         builder.leave(end_label, false, catch_span)?;
+        catch_region = Some((catch_target, builder.here()));
     }
 
     // The `finally` body, out-of-line: reached by a `leave` or by an error via the finally region.
@@ -685,15 +686,18 @@ pub(crate) fn compile_try(
         builder.push(Instruction::EndFinally.into_spanned(call.head))?;
     }
 
-    builder.set_label(end_label, builder.here())?;
+    let end_pc = builder.here();
+    builder.set_label(end_label, end_pc)?;
 
     // Record the protected regions. A `catch` captures the error into `io_reg` (as `$err`/input); a
-    // finally with a variable receives it there too. The finally range covers the body and catch.
-    if let Some(catch_target) = catch_target {
+    // finally with a variable receives it there too. The finally range covers the body and catch;
+    // `handler_end` bounds the out-of-line handler body (the finally body runs up to `end_pc`).
+    if let Some((catch_target, catch_end)) = catch_region {
         builder.push_region(TryRegion {
             start: body_start,
             end: body_end,
             target: catch_target,
+            handler_end: catch_end,
             error_register: catch_type.is_some().then_some(io_reg),
             kind: RegionKind::Catch,
         });
@@ -704,6 +708,7 @@ pub(crate) fn compile_try(
             start: body_start,
             end: finally_target,
             target: finally_target,
+            handler_end: end_pc,
             error_register,
             kind: RegionKind::Finally,
         });
