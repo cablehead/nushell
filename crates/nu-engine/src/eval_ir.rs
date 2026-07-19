@@ -264,8 +264,10 @@ fn eval_ir_block_impl<D: DebugContext>(
                 pc = next_pc;
             }
             Ok(InstructionResult::Return(reg_id)) => {
-                // The block's terminal return, reached only on the normal path (an exit that ran
-                // finallys is delivered by `begin_unwind`/`resume_unwind` returning `Step::Done`).
+                // The block's terminal return. An exit that ran its finallys is delivered earlier,
+                // when `begin_unwind`/`resume_unwind` return `Step::Done`. If a `bail` is still
+                // pending here, its `finally` completed abruptly (threw or exited) and was handled
+                // outside, which discards the pending exit (JLS 14.20.2): drop it, return the value.
                 return Ok(ctx.take_reg(reg_id));
             }
             Ok(InstructionResult::ReturnEarly(reg_id)) => {

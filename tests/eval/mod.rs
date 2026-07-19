@@ -852,6 +852,51 @@ fn break_in_catch_runs_finally() -> Result {
     .expect_value_eq(test_value!({ ran: ["catch", "finally", "after loop"] }))
 }
 
+// A `finally` that completes abruptly (throws or exits) while a `return`/`break` is pending
+// discards that pending exit; the finally's exit takes over (Java JLS 14.20.2, Python). If the
+// finally completes normally instead (an error inside it is caught inside it), the pending exit
+// survives.
+
+#[test]
+fn finally_error_caught_outside_discards_pending_return() -> Result {
+    // The inner `finally` throws, discarding the pending `return 99`; the throw is caught by the
+    // outer `catch`, and the return does not re-emerge, so the code after the try runs.
+    test_eval(
+        r#"def foo [] { try { try { return 99 } finally { error make { msg: rf } } } catch { null }; 7 }
+        foo"#,
+        Eq("7"),
+    );
+    Ok(())
+}
+
+#[test]
+fn finally_error_caught_inside_keeps_pending_return() -> Result {
+    // The `finally` completes normally (its error is caught within it), so the pending `return`
+    // survives.
+    test_eval(
+        r#"def foo [] { try { return 5 } finally { try { error make { msg: x } } catch { "c" } } }
+        foo"#,
+        Eq("5"),
+    );
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn finally_error_discards_pending_break() -> Result {
+    // The inner `finally` throws, discarding the pending `break`; the throw is caught by the outer
+    // `catch`, so the loop keeps iterating instead of breaking.
+    finally_scenario(
+        r#"for x in [1 2] {
+            "i" | job send 0
+            try { try { break } finally { error make { msg: rf } } } catch { "c" | job send 0 } finally { "f" | job send 0 }
+        }
+        "after" | job send 0
+        { ran: (drain) }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["i", "c", "f", "i", "c", "f", "after"] }))
+}
+
 #[test]
 fn try_no_catch() {
     test_eval("try { error make { msg: foo } }; 'pass'", Eq("pass"))
