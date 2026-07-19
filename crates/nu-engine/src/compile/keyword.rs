@@ -547,32 +547,9 @@ pub(crate) fn compile_try(
         })
         .transpose()?;
 
-    // Put the error handler instruction. If we have a catch expression then we should capture the
-    // error.
-    let mut has_try_comment = false;
-    let mut pushed_error_handler = false;
-    if catch_type.is_some() {
-        builder.push(
-            Instruction::OnErrorInto {
-                index: err_label.0,
-                dst: io_reg,
-            }
-            .into_spanned(call.head),
-        )?;
-        builder.add_comment("try");
-        has_try_comment = true;
-        pushed_error_handler = true;
-    } else if finally_expr.is_none() {
-        // Simply try, without `catch` and `finally` block, need to set up OnErrorHandler.
-        // so `try { 1 / 0 }` works
-        builder.push(Instruction::OnError { index: err_label.0 }.into_spanned(call.head))?;
-        builder.add_comment("try");
-        has_try_comment = true;
-        pushed_error_handler = true;
-    };
-
-    builder.begin_try();
-
+    // Set up the handlers. Push the `finally` handler FIRST, then the `catch`, so on the unified
+    // runtime handler stack the `catch` sits above its own `finally`: a body error reaches the
+    // `catch` first, and the `finally` runs afterward on the way out.
     if let Some(finally_info) = &finally_type {
         if finally_info.var_id.is_some() {
             builder.push(
@@ -585,9 +562,32 @@ pub(crate) fn compile_try(
         } else {
             builder.push(Instruction::Finally { index: end_label.0 }.into_spanned(call.head))?;
         }
-        if !has_try_comment {
+        builder.add_comment("try");
+        builder.begin_pending_finally();
+    }
+
+    let mut pushed_error_handler = false;
+    if catch_type.is_some() {
+        builder.push(
+            Instruction::OnErrorInto {
+                index: err_label.0,
+                dst: io_reg,
+            }
+            .into_spanned(call.head),
+        )?;
+        if finally_type.is_none() {
             builder.add_comment("try");
         }
+        pushed_error_handler = true;
+    } else if finally_expr.is_none() {
+        // Simply try, without `catch` and `finally` block, need to set up an error handler,
+        // so `try { 1 / 0 }` works.
+        builder.push(Instruction::OnError { index: err_label.0 }.into_spanned(call.head))?;
+        builder.add_comment("try");
+        pushed_error_handler = true;
+    }
+    if pushed_error_handler {
+        builder.begin_pending_catch();
     }
 
     // Compile the block
@@ -622,9 +622,8 @@ pub(crate) fn compile_try(
 
     if pushed_error_handler {
         builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
+        builder.end_pending_catch()?;
     }
-
-    builder.end_try()?;
 
     // Jump over the failure case
     builder.jump(end_label, catch_span)?;
@@ -684,6 +683,7 @@ pub(crate) fn compile_try(
     builder.set_label(end_label, builder.here())?;
     if finally_type.is_some() {
         builder.push(Instruction::PopFinallyRun.into_spanned(call.head))?;
+        builder.end_pending_finally()?;
     }
 
     // This is the finally part.
@@ -701,6 +701,7 @@ pub(crate) fn compile_try(
                 .into_spanned(call.head),
             )?;
         }
+        builder.begin_finally_body();
         compile_block(
             working_set,
             builder,
@@ -709,6 +710,7 @@ pub(crate) fn compile_try(
             Some(io_reg),
             io_reg,
         )?;
+        builder.end_finally_body()?;
         builder.push(
             Instruction::Move {
                 dst: io_reg,
@@ -716,6 +718,10 @@ pub(crate) fn compile_try(
             }
             .into_spanned(call.head),
         )?;
+        // Marks the end of the `finally` block. On the success path this is a no-op; when a
+        // bail-out (`return`/error/exit) is pending, it resumes that bail-out instead of falling
+        // through into the code after the `try`.
+        builder.push(Instruction::RunFinally.into_spanned(call.head))?;
     }
 
     Ok(())
@@ -1023,19 +1029,7 @@ pub(crate) fn compile_break(
     _input_reg: Option<RegId>,
     io_reg: RegId,
 ) -> Result<(), CompileError> {
-    if !builder.is_in_loop() {
-        return Err(CompileError::NotInALoop {
-            msg: "'break' can only be used inside a loop".to_string(),
-            span: Some(call.head),
-        });
-    }
-    builder.load_empty(io_reg)?;
-    for _ in 0..builder.context_stack.try_block_depth_from_loop() {
-        builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
-    }
-    builder.push_break(call.head)?;
-    builder.add_comment("break");
-    Ok(())
+    compile_loop_exit(builder, call, io_reg, true)
 }
 
 /// Compile a call to `continue`.
@@ -1047,18 +1041,30 @@ pub(crate) fn compile_continue(
     _input_reg: Option<RegId>,
     io_reg: RegId,
 ) -> Result<(), CompileError> {
+    compile_loop_exit(builder, call, io_reg, false)
+}
+
+/// Compile a `break` (`is_break`) or `continue`: leave the enclosing loop, unwinding the
+/// `catch`/`finally` handlers of every `try` block between here and the loop (running the finallys,
+/// discarding the catches) via a single `jump-early`.
+fn compile_loop_exit(
+    builder: &mut BlockBuilder,
+    call: &Call,
+    io_reg: RegId,
+    is_break: bool,
+) -> Result<(), CompileError> {
+    let keyword = if is_break { "break" } else { "continue" };
     if !builder.is_in_loop() {
         return Err(CompileError::NotInALoop {
-            msg: "'continue' can only be used inside a loop".to_string(),
+            msg: format!("'{keyword}' can only be used inside a loop"),
             span: Some(call.head),
         });
     }
     builder.load_empty(io_reg)?;
-    for _ in 0..builder.context_stack.try_block_depth_from_loop() {
-        builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
-    }
-    builder.push_continue(call.head)?;
-    builder.add_comment("continue");
+    let handler_count = builder.context_stack.handler_depth_from_loop();
+    let supersedes = builder.context_stack.crosses_finally_to_loop();
+    builder.push_loop_exit(is_break, handler_count, supersedes, call.head)?;
+    builder.add_comment(keyword);
     Ok(())
 }
 

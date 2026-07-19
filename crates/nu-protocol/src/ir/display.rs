@@ -280,8 +280,22 @@ impl fmt::Display for FmtInstruction<'_> {
             Instruction::PopFinallyRun => {
                 write!(f, "{:WIDTH$}", "pop-finally")
             }
+            Instruction::RunFinally => {
+                write!(f, "{:WIDTH$}", "run-finally")
+            }
             Instruction::ReturnEarly { src } => {
                 write!(f, "{:WIDTH$} {src}", "return-early")
+            }
+            Instruction::JumpEarly {
+                index,
+                handler_count,
+                supersedes,
+            } => {
+                write!(
+                    f,
+                    "{:WIDTH$} {index}, handlers {handler_count}, supersedes {supersedes}",
+                    "jump-early"
+                )
             }
             Instruction::Return { src } => {
                 write!(f, "{:WIDTH$} {src}", "return")

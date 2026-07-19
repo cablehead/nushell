@@ -446,6 +446,7 @@ fn early_return_keeps_stream() -> Result {
 }
 
 #[test]
+#[serial]
 fn early_return_with_finally_runs_cleanup_and_keeps_value() -> Result {
     // In-process `print` output isn't captured, so the `finally` block reports through the root
     // job's mailbox (`job send 0`) instead. The recovered message and the returned value confirm
@@ -541,6 +542,314 @@ fn early_return_in_module_export_env_does_not_abort_caller() -> Result {
                 .expect_value_eq("hi")
         },
     )
+}
+
+// ===================================================================================
+// Control-flow signals through `finally`: behavior matrix
+//
+// Markers printed by each case: F = finally ran, I/O = inner/outer finally, C = catch ran,
+// A = code after the try ran, D = code after a loop ran. Trailing letter(s) = the returned
+// value. So "FV" means: finally ran, then the command returned "V".
+//
+// How control flow interacts with `finally`.
+//
+// The rule: leaving a `try` runs its `finally` first, then the exit keeps going. The code after
+// the try/finally does not run, and the exit is not lost. Nested finallys run inner first, then
+// outer. If the finally itself exits, its exit replaces whatever the try was doing.
+//
+// Each case runs in-process via `finally_scenario`. A step of interest announces itself with
+// `"<name>" | job send 0`; the scenario drains those into an ordered `ran` list and reports
+// `{ ran, returned }` (or `{ ran, errored }` when the outcome is an error). So `ran` shows which
+// steps ran and in what order, and `returned` shows the value that came out. Each test's expected
+// record is the source of truth; the list below is a map.
+//
+// A. A signal leaves the try: the finally runs, the signal keeps going, code after is skipped.
+//    1  return, finally, code after
+//    2  return, catch + finally, code after
+//    3  return, catch, no finally                [guard]
+//    4  return, finally, tail                     [guard]
+//    5  return, nested finallys
+//    6  no signal, finally, code after            [guard]  (the only case where code after runs)
+//    7  break, finally
+//    8  break, nested finallys
+//    9  continue, finally
+//   10  continue, nested finallys
+//
+// B. The finally itself exits: its exit wins over the try's pending exit.
+//   11  finally returns over a pending return
+//   12  finally errors  over a pending return
+//   13  finally breaks  over a pending return
+//   14  finally continues over a pending return
+//
+// An error leaves a try the same way: the finally runs and the error propagates (and an enclosing
+// `catch` may intercept it after the inner finallys run; see the enclosing-catch tests below).
+//
+// All of these hold. Every exit walks one unified `catch`/`finally` handler stack in nesting order
+// (eval_ir.rs): `return`/error/`exit` unwind to the block base via the `run-finally` chain, and
+// `break`/`continue` unwind to their loop via `jump-early` (compile/keyword.rs), running each
+// pending finally and discarding each catch in the way. A `break`/`continue` that leaves a finally
+// supersedes a pending return (13, 14 return the tail, not the leaked value). One that stays inside
+// the finally, targeting a loop nested in it, is local and keeps the pending return instead (see
+// the local_*_in_finally tests).
+
+/// Run a `finally` scenario in-process and return the record it builds. A step in the snippet
+/// announces itself with `"<name>" | job send 0`; the `drain` command (made available here) empties
+/// those from the root job's mailbox into an ordered list, so a scenario ends in, for example,
+/// `{ ran: (drain), returned: $returned }`.
+fn finally_scenario(code: &str) -> Result<Value> {
+    let drain = "def drain [] { mut r = []; loop { let m = (try { job recv --timeout 0sec } catch { break }); $r = ($r | append $m) }; $r }";
+    test().run(format!("{drain}\n{code}"))
+}
+
+#[test]
+#[serial]
+fn finally_return_skips_code_after() -> Result {
+    finally_scenario(
+        r#"def foo [] { try { return "returned" } finally { "finally" | job send 0 }; "after try" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "returned" }))
+}
+
+#[test]
+#[serial]
+fn finally_return_with_catch_skips_code_after() -> Result {
+    finally_scenario(
+        r#"def foo [] { try { return "returned" } catch { "catch" | job send 0 } finally { "finally" | job send 0 }; "after try" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "returned" }))
+}
+
+#[test]
+#[serial]
+fn return_with_catch_no_finally_skips_code_after() -> Result {
+    // guard: without a finally, `return` already skips the code after the try.
+    finally_scenario(
+        r#"def foo [] { try { return "returned" } catch { "catch" | job send 0 }; "after try" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: [], returned: "returned" }))
+}
+
+#[test]
+#[serial]
+fn finally_return_in_tail_runs_finally() -> Result {
+    // guard: the everyday case, `return` last in the body, keeps working.
+    finally_scenario(
+        r#"def foo [] { try { return "returned" } finally { "finally" | job send 0 } }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "returned" }))
+}
+
+#[test]
+#[serial]
+fn finally_return_runs_nested_finallys_then_skips_code_after() -> Result {
+    finally_scenario(
+        r#"def foo [] { try { try { return "returned" } finally { "inner" | job send 0 } } finally { "outer" | job send 0 }; "after try" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["inner", "outer"], returned: "returned" }))
+}
+
+#[test]
+#[serial]
+fn finally_and_code_after_both_run_on_success() -> Result {
+    // 6 (guard): with nothing leaving the try, the finally runs and the code after runs too.
+    finally_scenario(
+        r#"def foo [] { try { "body" } finally { "finally" | job send 0 }; "after try" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally", "after try"], returned: "tail" }))
+}
+
+#[test]
+#[serial]
+fn finally_runs_on_break() -> Result {
+    finally_scenario(
+        r#"for x in [1] { try { break } finally { "finally" | job send 0 } }
+        "after loop" | job send 0
+        { ran: (drain) }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally", "after loop"] }))
+}
+
+#[test]
+#[serial]
+fn finally_runs_on_break_nested() -> Result {
+    finally_scenario(
+        r#"for x in [1] { try { try { break } finally { "inner" | job send 0 } } finally { "outer" | job send 0 } }
+        "after loop" | job send 0
+        { ran: (drain) }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["inner", "outer", "after loop"] }))
+}
+
+#[test]
+#[serial]
+fn finally_runs_on_continue() -> Result {
+    finally_scenario(
+        r#"for x in [1 2] { try { continue } finally { "finally" | job send 0 } }
+        "after loop" | job send 0
+        { ran: (drain) }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally", "finally", "after loop"] }))
+}
+
+#[test]
+#[serial]
+fn finally_runs_on_continue_nested() -> Result {
+    finally_scenario(
+        r#"for x in [1 2] { try { try { continue } finally { "inner" | job send 0 } } finally { "outer" | job send 0 } }
+        "after loop" | job send 0
+        { ran: (drain) }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["inner", "outer", "inner", "outer", "after loop"] }))
+}
+
+#[test]
+#[serial]
+fn finally_return_overrides_pending_return() -> Result {
+    // 11 (guard): a `return` in the finally wins over a `return` pending from the try.
+    finally_scenario(
+        r#"def foo [] { try { return 5 } finally { "finally" | job send 0; return 7 } }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: 7 }))
+}
+
+#[test]
+#[serial]
+fn finally_error_overrides_pending_return() -> Result {
+    // 12 (guard): an error in the finally wins over a `return` pending from the try.
+    finally_scenario(
+        r#"def foo [] { try { return 5 } finally { "finally" | job send 0; error make { msg: "from finally" } } }
+        let errored = (try { foo; null } catch { |e| $e.msg })
+        { ran: (drain), errored: $errored }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], errored: "from finally" }))
+}
+
+#[test]
+#[serial]
+fn finally_break_overrides_pending_return() -> Result {
+    finally_scenario(
+        r#"def foo [] { for x in [1 2] { try { return "returned" } finally { "finally" | job send 0; break } }; "after loop" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally", "after loop"], returned: "tail" }))
+}
+
+#[test]
+#[serial]
+fn finally_continue_overrides_pending_return() -> Result {
+    finally_scenario(
+        r#"def foo [] { for x in [1 2] { try { return "returned" } finally { "finally" | job send 0; continue } }; "after loop" | job send 0; "tail" }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally", "finally", "after loop"], returned: "tail" }))
+}
+
+// A `break`/`continue` that stays inside the finally (it targets a loop nested in the finally, not
+// an enclosing one) is local: it does not supersede the pending return, which resumes once the
+// finally completes. Contrast 13/14, where the break/continue leaves the finally and wins.
+#[test]
+#[serial]
+fn local_break_in_finally_keeps_pending_return() -> Result {
+    finally_scenario(
+        r#"def foo [] {
+            try { return "returned" } finally { for y in [1] { break }; "finally" | job send 0 }
+            "after try" | job send 0
+            "tail"
+        }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "returned" }))
+}
+
+#[test]
+#[serial]
+fn local_continue_in_finally_keeps_pending_return() -> Result {
+    finally_scenario(
+        r#"def foo [] {
+            try { return "returned" } finally { for y in [1 2] { continue }; "finally" | job send 0 }
+            "after try" | job send 0
+            "tail"
+        }
+        let returned = foo
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "returned" }))
+}
+
+// An error that is caught by an *enclosing* `catch` must still run the `finally` of every inner
+// `try` it unwinds past, in order, before the catch handles it. These cases were wrong before the
+// `catch`/`finally` handler stacks were unified into one walked in nesting order: the enclosing
+// catch was consulted before the inner finally, so the inner finally was skipped.
+
+#[test]
+#[serial]
+fn error_runs_inner_finally_before_outer_catch() -> Result {
+    finally_scenario(
+        r#"let returned = (try { try { error make { msg: "a" } } finally { "finally" | job send 0 } } catch { |e| $e.msg })
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["finally"], returned: "a" }))
+}
+
+#[test]
+#[serial]
+fn catch_that_throws_runs_inner_finally_before_outer_catch() -> Result {
+    // The inner `catch` throws while an outer `catch` is waiting: the inner `finally` must run
+    // before the outer catch, and the outer catch sees the catch's error.
+    finally_scenario(
+        r#"let returned = (try { try { error make { msg: "a" } } catch { "catch" | job send 0; error make { msg: "b" } } finally { "finally" | job send 0 } } catch { |e| $e.msg })
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["catch", "finally"], returned: "b" }))
+}
+
+#[test]
+#[serial]
+fn error_runs_nested_finallys_before_outer_catch() -> Result {
+    finally_scenario(
+        r#"let returned = (try { try { try { error make { msg: "a" } } finally { "f1" | job send 0 } } finally { "f2" | job send 0 } } catch { |e| $e.msg })
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["f1", "f2"], returned: "a" }))
+}
+
+#[test]
+#[serial]
+fn catch_that_throws_runs_nested_finallys_before_outer_catch() -> Result {
+    finally_scenario(
+        r#"let returned = (try { try { try { error make { msg: "a" } } catch { "c1" | job send 0; error make { msg: "b" } } finally { "f1" | job send 0 } } finally { "f2" | job send 0 } } catch { |e| $e.msg })
+        { ran: (drain), returned: $returned }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["c1", "f1", "f2"], returned: "b" }))
+}
+
+#[test]
+#[serial]
+fn break_in_catch_runs_finally() -> Result {
+    // A `break` from inside a `catch` still leaves through that `try`'s `finally`.
+    finally_scenario(
+        r#"for x in [1] { try { error make { msg: "a" } } catch { "catch" | job send 0; break } finally { "finally" | job send 0 } }
+        "after loop" | job send 0
+        { ran: (drain) }"#,
+    )
+    .expect_value_eq(test_value!({ ran: ["catch", "finally", "after loop"] }))
 }
 
 #[test]

@@ -274,6 +274,10 @@ pub enum Instruction {
     PopErrorHandler,
     /// Pop an finally handler.
     PopFinallyRun,
+    /// Marks the end of an inline `finally` block. On the normal (success) path this is a no-op.
+    /// When a bail-out (`return`/error/exit) is pending, it resumes that bail-out: it runs the
+    /// next enclosing `finally`, or leaves the block with the pending value once none remain.
+    RunFinally,
     /// Return early from the block with the value in the register.
     ///
     /// Unlike `return`, this runs pending `finally` handlers first (collecting the value in that
@@ -281,6 +285,17 @@ pub enum Instruction {
     /// return. Custom command and closure calls clear that flag; only top-level file evaluation
     /// reads it, to skip `main`.
     ReturnEarly { src: RegId },
+    /// Leave a loop via `break`/`continue`, unwinding the `handler_count` `catch`/`finally`
+    /// handlers that sit between here and the loop (innermost first): each pending `finally` runs,
+    /// each `catch` is discarded, then control jumps to `index` (the loop's break or continue
+    /// label). `supersedes` is set when this exit leaves a `finally`, in which case it discards a
+    /// pending `return`/error whose `finally` is currently running; when unset (a break/continue
+    /// local to a loop nested inside a finally) that pending exit is kept.
+    JumpEarly {
+        index: usize,
+        handler_count: usize,
+        supersedes: bool,
+    },
     /// Return from the block with the value in the register
     Return { src: RegId },
 }
@@ -358,7 +373,9 @@ impl Instruction {
             Instruction::FinallyInto { .. } => None,
             Instruction::PopErrorHandler => None,
             Instruction::PopFinallyRun => None,
+            Instruction::RunFinally => None,
             Instruction::ReturnEarly { .. } => None,
+            Instruction::JumpEarly { .. } => None,
             Instruction::Return { .. } => None,
         }
     }
@@ -384,6 +401,7 @@ impl Instruction {
             Instruction::OnErrorInto { index, dst: _ } => Some(*index),
             Instruction::Finally { index } => Some(*index),
             Instruction::FinallyInto { index, dst: _ } => Some(*index),
+            Instruction::JumpEarly { index, .. } => Some(*index),
             _ => None,
         }
     }
@@ -411,6 +429,7 @@ impl Instruction {
             Instruction::OnErrorInto { index, dst: _ } => *index = target_index,
             Instruction::Finally { index } => *index = target_index,
             Instruction::FinallyInto { index, dst: _ } => *index = target_index,
+            Instruction::JumpEarly { index, .. } => *index = target_index,
             _ => return Err(target_index),
         }
         Ok(())
