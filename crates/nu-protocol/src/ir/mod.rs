@@ -24,6 +24,37 @@ pub struct IrBlock {
     pub comments: Vec<Box<str>>,
     pub register_count: u32,
     pub file_count: u32,
+    /// Protected `try` regions, driving `catch`/`finally` control flow. Instead of pushing and
+    /// popping handlers at runtime, each `try` records the instruction range it protects and where
+    /// its `catch`/`finally` live; the evaluator looks up the covering region(s) when an error or a
+    /// structured exit ([`Instruction::Leave`], [`Instruction::ReturnEarly`]) unwinds. See
+    /// [`TryRegion`].
+    pub regions: Vec<TryRegion>,
+}
+
+/// A protected `try` region and the `catch` or `finally` it routes to. Regions nest by containment;
+/// the innermost region covering an instruction is the one with the smallest range around it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TryRegion {
+    /// First protected instruction index (inclusive).
+    pub start: usize,
+    /// One past the last protected instruction index (exclusive).
+    pub end: usize,
+    /// Instruction index of the `catch` or `finally` body this region transfers to.
+    pub target: usize,
+    /// Register that receives the error (or the try/catch value, for a `finally` with a variable)
+    /// when control enters the target. `None` when nothing is bound.
+    pub error_register: Option<RegId>,
+    /// Whether this region catches an error or always runs on the way out.
+    pub kind: RegionKind,
+}
+
+/// Whether a [`TryRegion`] is a `catch` (handles an error, stopping it) or a `finally` (runs on
+/// every exit, then the pending exit continues).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegionKind {
+    Catch,
+    Finally,
 }
 
 impl fmt::Debug for IrBlock {
@@ -259,43 +290,23 @@ pub enum Instruction {
         stream: RegId,
         end_index: usize,
     },
-    /// Push an error handler, without capturing the error value
-    OnError { index: usize },
-    /// Push an error handler, capturing the error value into `dst`. If the error handler is not
-    /// called, the register should be freed manually.
-    OnErrorInto { index: usize, dst: RegId },
-    /// Push an finally handler, without capturing the error value
-    Finally { index: usize },
-    /// Push an finally handler, capturing the error value into `dst`. If the finally handler is not
-    /// called, the register should be freed manually.
-    FinallyInto { index: usize, dst: RegId },
-    /// Pop an error handler. This is not necessary when control flow is directed to the error
-    /// handler due to an error.
-    PopErrorHandler,
-    /// Pop an finally handler.
-    PopFinallyRun,
-    /// Marks the end of an inline `finally` block. On the normal (success) path this is a no-op.
-    /// When a bail-out (`return`/error/exit) is pending, it resumes that bail-out: it runs the
-    /// next enclosing `finally`, or leaves the block with the pending value once none remain.
-    RunFinally,
+    /// Structured exit that runs pending `finally` blocks before transferring control. Used for
+    /// normal `try` completion, `catch` completion, and `break`/`continue`. Runs every `finally`
+    /// whose protected region (in [`IrBlock::regions`]) covers this instruction but does not cover
+    /// `index`, innermost first, then jumps to `index`. `supersedes` discards a pending
+    /// `return`/error whose `finally` this exit runs inside (a `break`/`continue` leaving a finally).
+    Leave { index: usize, supersedes: bool },
+    /// Marks the end of an out-of-line `finally` block. Resumes whatever entered the finally: it
+    /// runs the next enclosing `finally`, or performs the pending exit (return/jump/propagate) once
+    /// none remain. On a normal completion with nothing pending it falls through to the code after.
+    EndFinally,
     /// Return early from the block with the value in the register.
     ///
-    /// Unlike `return`, this runs pending `finally` handlers first (collecting the value in that
+    /// Unlike `return`, this runs pending `finally` blocks first (collecting the value in that
     /// case, like the `try-collect` on the fall-through path), and flags the result as an early
     /// return. Custom command and closure calls clear that flag; only top-level file evaluation
     /// reads it, to skip `main`.
     ReturnEarly { src: RegId },
-    /// Leave a loop via `break`/`continue`, unwinding the `handler_count` `catch`/`finally`
-    /// handlers that sit between here and the loop (innermost first): each pending `finally` runs,
-    /// each `catch` is discarded, then control jumps to `index` (the loop's break or continue
-    /// label). `supersedes` is set when this exit leaves a `finally`, in which case it discards a
-    /// pending `return`/error whose `finally` is currently running; when unset (a break/continue
-    /// local to a loop nested inside a finally) that pending exit is kept.
-    JumpEarly {
-        index: usize,
-        handler_count: usize,
-        supersedes: bool,
-    },
     /// Return from the block with the value in the register
     Return { src: RegId },
 }
@@ -367,15 +378,9 @@ impl Instruction {
             Instruction::Match { .. } => None,
             Instruction::CheckMatchGuard { .. } => None,
             Instruction::Iterate { dst, .. } => Some(dst),
-            Instruction::OnError { .. } => None,
-            Instruction::Finally { .. } => None,
-            Instruction::OnErrorInto { .. } => None,
-            Instruction::FinallyInto { .. } => None,
-            Instruction::PopErrorHandler => None,
-            Instruction::PopFinallyRun => None,
-            Instruction::RunFinally => None,
+            Instruction::Leave { .. } => None,
+            Instruction::EndFinally => None,
             Instruction::ReturnEarly { .. } => None,
-            Instruction::JumpEarly { .. } => None,
             Instruction::Return { .. } => None,
         }
     }
@@ -397,11 +402,7 @@ impl Instruction {
                 stream: _,
                 end_index,
             } => Some(*end_index),
-            Instruction::OnError { index } => Some(*index),
-            Instruction::OnErrorInto { index, dst: _ } => Some(*index),
-            Instruction::Finally { index } => Some(*index),
-            Instruction::FinallyInto { index, dst: _ } => Some(*index),
-            Instruction::JumpEarly { index, .. } => Some(*index),
+            Instruction::Leave { index, .. } => Some(*index),
             _ => None,
         }
     }
@@ -425,11 +426,7 @@ impl Instruction {
                 stream: _,
                 end_index,
             } => *end_index = target_index,
-            Instruction::OnError { index } => *index = target_index,
-            Instruction::OnErrorInto { index, dst: _ } => *index = target_index,
-            Instruction::Finally { index } => *index = target_index,
-            Instruction::FinallyInto { index, dst: _ } => *index = target_index,
-            Instruction::JumpEarly { index, .. } => *index = target_index,
+            Instruction::Leave { index, .. } => *index = target_index,
             _ => return Err(target_index),
         }
         Ok(())

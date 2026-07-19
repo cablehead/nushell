@@ -2,8 +2,8 @@ use crate::{
     Config, ENV_VARIABLE_ID, IntoValue, NU_VARIABLE_ID, OutDest, ShellError, Span, Value, VarId,
     ast::PathMember,
     engine::{
-        ArgumentStack, DEFAULT_OVERLAY_NAME, EngineState, EnvName, HandlerStack, Redirection,
-        StackCallArgGuard, StackCollectValueGuard, StackIoGuard, StackOutDest,
+        ArgumentStack, DEFAULT_OVERLAY_NAME, EngineState, EnvName, Redirection, StackCallArgGuard,
+        StackCollectValueGuard, StackIoGuard, StackOutDest,
     },
     report_shell_warning,
     shell_error::generic::GenericError,
@@ -52,9 +52,6 @@ pub struct Stack {
     pub active_overlays: Vec<String>,
     /// Argument stack for IR evaluation
     pub arguments: ArgumentStack,
-    /// Unified `catch`/`finally` handler stack for IR evaluation. Both kinds share one stack so
-    /// their nesting order is structural; the evaluator walks it on every exit. See [`HandlerStack`].
-    pub handlers: HandlerStack,
     pub recursion_count: u64,
     pub parent_stack: Option<Arc<Stack>>,
     /// Variables that have been deleted (this is used to hide values from parent stack lookups)
@@ -91,7 +88,6 @@ impl Stack {
             env_hide_history: Arc::new(HashMap::new()),
             active_overlays: vec![DEFAULT_OVERLAY_NAME.to_string()],
             arguments: ArgumentStack::new(),
-            handlers: HandlerStack::new(),
             recursion_count: 0,
             parent_stack: None,
             parent_deletions: vec![],
@@ -114,7 +110,6 @@ impl Stack {
             env_hide_history: parent.env_hide_history.clone(),
             active_overlays: parent.active_overlays.clone(),
             arguments: ArgumentStack::new(),
-            handlers: HandlerStack::new(),
             recursion_count: parent.recursion_count,
             vars: vec![],
             parent_deletions: vec![],
@@ -387,7 +382,6 @@ impl Stack {
             env_hide_history: self.env_hide_history.clone(),
             active_overlays: self.active_overlays.clone(),
             arguments: ArgumentStack::new(),
-            handlers: HandlerStack::new(),
             recursion_count: self.recursion_count,
             parent_stack: None,
             parent_deletions: vec![],
@@ -423,7 +417,6 @@ impl Stack {
             env_hide_history: self.env_hide_history.clone(),
             active_overlays: self.active_overlays.clone(),
             arguments: ArgumentStack::new(),
-            handlers: HandlerStack::new(),
             recursion_count: self.recursion_count,
             parent_stack: None,
             parent_deletions: vec![],

@@ -1,7 +1,7 @@
 use nu_protocol::{
     CompileError, IntoSpanned, RegId, Span, Spanned,
     ast::Pattern,
-    ir::{DataSlice, Instruction, IrAstRef, IrBlock, Literal},
+    ir::{DataSlice, Instruction, IrAstRef, IrBlock, Literal, TryRegion},
 };
 
 /// A label identifier. Only exists while building code. Replaced with the actual target.
@@ -26,6 +26,10 @@ pub(crate) struct BlockBuilder {
     pub(crate) register_allocation_state: Vec<bool>,
     pub(crate) file_count: u32,
     pub(crate) context_stack: ContextStack,
+    /// Protected `try` regions recorded during compilation. Their `start`/`end`/`target` are
+    /// concrete instruction indices (captured via [`here`](Self::here)); `finish()` does not move
+    /// instructions, so the indices stay valid.
+    pub(crate) regions: Vec<TryRegion>,
 }
 
 impl BlockBuilder {
@@ -42,6 +46,7 @@ impl BlockBuilder {
             register_allocation_state: vec![true],
             file_count: 0,
             context_stack: ContextStack::new(),
+            regions: vec![],
         }
     }
 
@@ -287,15 +292,9 @@ impl BlockBuilder {
                 stream,
                 end_index: _,
             } => allocate(&[*stream], &[*dst, *stream]),
-            Instruction::OnError { index: _ } => Ok(()),
-            Instruction::Finally { index: _ } => Ok(()),
-            Instruction::OnErrorInto { index: _, dst } => allocate(&[], &[*dst]),
-            Instruction::FinallyInto { index: _, dst } => allocate(&[], &[*dst]),
-            Instruction::PopErrorHandler => Ok(()),
-            Instruction::PopFinallyRun => Ok(()),
-            Instruction::RunFinally => Ok(()),
+            Instruction::Leave { .. } => Ok(()),
+            Instruction::EndFinally => Ok(()),
             Instruction::ReturnEarly { src } => allocate(&[*src], &[]),
-            Instruction::JumpEarly { .. } => Ok(()),
             Instruction::Return { src } => allocate(&[*src], &[]),
         };
 
@@ -497,38 +496,47 @@ impl BlockBuilder {
         self.context_stack.is_in_loop()
     }
 
-    /// Emit a `jump-early` for `break` (`is_break`) or `continue`: unwind the `handler_count`
-    /// `catch`/`finally` handlers between here and the loop (running the finallys, discarding the
-    /// catches), then jump to the loop's break or continue label. `supersedes` is set when this
-    /// exit leaves a `finally`, so it discards a pending return/error.
-    pub(crate) fn push_loop_exit(
+    /// Emit a `leave` to `target`, running the `finally` blocks whose region covers this point but
+    /// not `target`, innermost first, then jumping to `target`. `supersedes` discards a pending
+    /// `return`/error whose `finally` this leave runs inside (a `break`/`continue` leaving a finally).
+    pub(crate) fn leave(
         &mut self,
-        is_break: bool,
-        handler_count: usize,
+        target: LabelId,
         supersedes: bool,
         span: Span,
     ) -> Result<(), CompileError> {
-        let loop_ = self
-            .context_stack
-            .current_loop()
-            .ok_or_else(|| CompileError::NotInALoop {
-                msg: "loop control used outside of a loop".into(),
-                span: Some(span),
-            })?;
-        let index = if is_break {
-            loop_.break_label
-        } else {
-            loop_.continue_label
-        }
-        .0;
         self.push(
-            Instruction::JumpEarly {
-                index,
-                handler_count,
+            Instruction::Leave {
+                index: target.0,
                 supersedes,
             }
             .into_spanned(span),
         )
+    }
+
+    /// Emit a `leave` to the enclosing loop's break (`is_break`) or continue label, for
+    /// `break`/`continue`. The covering `finally` blocks run via the region table.
+    pub(crate) fn push_loop_exit(
+        &mut self,
+        is_break: bool,
+        supersedes: bool,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        let target = {
+            let loop_ =
+                self.context_stack
+                    .current_loop()
+                    .ok_or_else(|| CompileError::NotInALoop {
+                        msg: "loop control used outside of a loop".into(),
+                        span: Some(span),
+                    })?;
+            if is_break {
+                loop_.break_label
+            } else {
+                loop_.continue_label
+            }
+        };
+        self.leave(target, supersedes, span)
     }
 
     /// Pop the loop state. Checks that the loop being ended is the same one that was expected.
@@ -604,39 +612,13 @@ impl BlockBuilder {
                 .try_into()
                 .expect("register count overflowed in finish() despite previous checks"),
             file_count: self.file_count,
+            regions: self.regions,
         })
     }
 
-    /// Mark that a `catch` handler is now pending on the runtime stack (emitted an `on-error`).
-    pub(crate) fn begin_pending_catch(&mut self) {
-        self.context_stack.push_pending_catch();
-    }
-
-    /// Mark that the pending `catch` handler has been popped (emitted a `pop-error-handler`).
-    pub(crate) fn end_pending_catch(&mut self) -> Result<(), CompileError> {
-        match self.context_stack.pop() {
-            Some(ContextBlock::PendingCatch) => Ok(()),
-            _ => Err(CompileError::NotInATry {
-                msg: "end_pending_catch() called out of order".into(),
-                span: None,
-            }),
-        }
-    }
-
-    /// Mark that a `finally` handler is now pending on the runtime stack (emitted a `finally`).
-    pub(crate) fn begin_pending_finally(&mut self) {
-        self.context_stack.push_pending_finally();
-    }
-
-    /// Mark that the pending `finally` handler has been popped (emitted a `pop-finally`).
-    pub(crate) fn end_pending_finally(&mut self) -> Result<(), CompileError> {
-        match self.context_stack.pop() {
-            Some(ContextBlock::PendingFinally) => Ok(()),
-            _ => Err(CompileError::NotInATry {
-                msg: "end_pending_finally() called out of order".into(),
-                span: None,
-            }),
-        }
+    /// Record a protected `try` region. `start`/`end`/`target` are concrete instruction indices.
+    pub(crate) fn push_region(&mut self, region: TryRegion) {
+        self.regions.push(region);
     }
 
     /// Mark the start of compiling a `finally` block's body.
@@ -664,18 +646,9 @@ pub(crate) struct Loop {
 }
 
 /// Blocks that modify/define behavior for the instructions they contain.
-///
-/// `PendingCatch` and `PendingFinally` mirror the runtime handler stack: each is active for exactly
-/// the span in which its handler sits on that stack, so a `break`/`continue` can count how many
-/// handlers it must unwind to reach its loop. A `catch` spans only the `try` body; a `finally`
-/// spans the body and the `catch`, so a `break` inside a `catch` still runs that `try`'s `finally`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextBlock {
     Loop(Loop),
-    /// A `catch` handler is pending on the runtime stack (spans the `try` body).
-    PendingCatch,
-    /// A `finally` handler is pending on the runtime stack (spans the `try` body and its `catch`).
-    PendingFinally,
     /// The body of a `finally` block. A `break`/`continue` that crosses this to reach its loop is
     /// leaving the finally, so it supersedes any `return`/error whose finally is running.
     FinallyBody,
@@ -691,14 +664,6 @@ impl ContextStack {
 
     pub fn push_loop(&mut self, r#loop: Loop) {
         self.0.push(ContextBlock::Loop(r#loop));
-    }
-
-    pub fn push_pending_catch(&mut self) {
-        self.0.push(ContextBlock::PendingCatch);
-    }
-
-    pub fn push_pending_finally(&mut self) {
-        self.0.push(ContextBlock::PendingFinally);
     }
 
     pub fn push_finally_body(&mut self) {
@@ -723,19 +688,6 @@ impl ContextStack {
             .iter()
             .rev()
             .take_while(|cb| !matches!(cb, ContextBlock::Loop(_)))
-    }
-
-    /// How many `catch`/`finally` handlers a `break`/`continue` must unwind (running the finallys,
-    /// discarding the catches) to reach its loop.
-    pub fn handler_depth_from_loop(&self) -> usize {
-        self.frames_to_loop()
-            .filter(|cb| {
-                matches!(
-                    cb,
-                    ContextBlock::PendingCatch | ContextBlock::PendingFinally
-                )
-            })
-            .count()
     }
 
     /// Whether a `break`/`continue` leaves a `finally` block to reach its loop. If so, it supersedes

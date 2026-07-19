@@ -262,40 +262,14 @@ impl fmt::Display for FmtInstruction<'_> {
             } => {
                 write!(f, "{:WIDTH$} {dst}, {stream}, end {end_index}", "iterate")
             }
-            Instruction::OnError { index } => {
-                write!(f, "{:WIDTH$} {index}", "on-error")
+            Instruction::Leave { index, supersedes } => {
+                write!(f, "{:WIDTH$} {index}, supersedes {supersedes}", "leave")
             }
-            Instruction::Finally { index } => {
-                write!(f, "{:WIDTH$} {index}", "finally")
-            }
-            Instruction::FinallyInto { index, dst } => {
-                write!(f, "{:WIDTH$} {index}, {dst}", "finally-into")
-            }
-            Instruction::OnErrorInto { index, dst } => {
-                write!(f, "{:WIDTH$} {index}, {dst}", "on-error-into")
-            }
-            Instruction::PopErrorHandler => {
-                write!(f, "{:WIDTH$}", "pop-error-handler")
-            }
-            Instruction::PopFinallyRun => {
-                write!(f, "{:WIDTH$}", "pop-finally")
-            }
-            Instruction::RunFinally => {
-                write!(f, "{:WIDTH$}", "run-finally")
+            Instruction::EndFinally => {
+                write!(f, "{:WIDTH$}", "end-finally")
             }
             Instruction::ReturnEarly { src } => {
                 write!(f, "{:WIDTH$} {src}", "return-early")
-            }
-            Instruction::JumpEarly {
-                index,
-                handler_count,
-                supersedes,
-            } => {
-                write!(
-                    f,
-                    "{:WIDTH$} {index}, handlers {handler_count}, supersedes {supersedes}",
-                    "jump-early"
-                )
             }
             Instruction::Return { src } => {
                 write!(f, "{:WIDTH$} {src}", "return")
