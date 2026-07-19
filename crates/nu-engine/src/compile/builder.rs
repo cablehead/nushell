@@ -1,7 +1,7 @@
 use nu_protocol::{
     CompileError, IntoSpanned, RegId, Span, Spanned,
     ast::Pattern,
-    ir::{DataSlice, Instruction, IrAstRef, IrBlock, Literal},
+    ir::{DataSlice, Instruction, IrAstRef, IrBlock, Literal, TryRegion},
 };
 
 /// A label identifier. Only exists while building code. Replaced with the actual target.
@@ -26,6 +26,10 @@ pub(crate) struct BlockBuilder {
     pub(crate) register_allocation_state: Vec<bool>,
     pub(crate) file_count: u32,
     pub(crate) context_stack: ContextStack,
+    /// Protected `try` regions recorded during compilation. Their `start`/`end`/`target` are
+    /// concrete instruction indices (captured via [`here`](Self::here)); `finish()` does not move
+    /// instructions, so the indices stay valid.
+    pub(crate) regions: Vec<TryRegion>,
 }
 
 impl BlockBuilder {
@@ -42,6 +46,7 @@ impl BlockBuilder {
             register_allocation_state: vec![true],
             file_count: 0,
             context_stack: ContextStack::new(),
+            regions: vec![],
         }
     }
 
@@ -287,12 +292,8 @@ impl BlockBuilder {
                 stream,
                 end_index: _,
             } => allocate(&[*stream], &[*dst, *stream]),
-            Instruction::OnError { index: _ } => Ok(()),
-            Instruction::Finally { index: _ } => Ok(()),
-            Instruction::OnErrorInto { index: _, dst } => allocate(&[], &[*dst]),
-            Instruction::FinallyInto { index: _, dst } => allocate(&[], &[*dst]),
-            Instruction::PopErrorHandler => Ok(()),
-            Instruction::PopFinallyRun => Ok(()),
+            Instruction::Leave { .. } => Ok(()),
+            Instruction::EndFinally => Ok(()),
             Instruction::ReturnEarly { src } => allocate(&[*src], &[]),
             Instruction::Return { src } => allocate(&[*src], &[]),
         };
@@ -495,28 +496,47 @@ impl BlockBuilder {
         self.context_stack.is_in_loop()
     }
 
-    /// Add a loop breaking jump instruction.
-    pub(crate) fn push_break(&mut self, span: Span) -> Result<(), CompileError> {
-        let loop_ = self
-            .context_stack
-            .current_loop()
-            .ok_or_else(|| CompileError::NotInALoop {
-                msg: "`break` called from outside of a loop".into(),
-                span: Some(span),
-            })?;
-        self.jump(loop_.break_label, span)
+    /// Emit a `leave` to `target`, running the `finally` blocks whose region covers this point but
+    /// not `target`, innermost first, then jumping to `target`. `supersedes` discards a pending
+    /// `return`/error whose `finally` this leave runs inside (a `break`/`continue` leaving a finally).
+    pub(crate) fn leave(
+        &mut self,
+        target: LabelId,
+        supersedes: bool,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        self.push(
+            Instruction::Leave {
+                index: target.0,
+                supersedes,
+            }
+            .into_spanned(span),
+        )
     }
 
-    /// Add a loop continuing jump instruction.
-    pub(crate) fn push_continue(&mut self, span: Span) -> Result<(), CompileError> {
-        let loop_ = self
-            .context_stack
-            .current_loop()
-            .ok_or_else(|| CompileError::NotInALoop {
-                msg: "`continue` called from outside of a loop".into(),
-                span: Some(span),
-            })?;
-        self.jump(loop_.continue_label, span)
+    /// Emit a `leave` to the enclosing loop's break (`is_break`) or continue label, for
+    /// `break`/`continue`. The covering `finally` blocks run via the region table.
+    pub(crate) fn push_loop_exit(
+        &mut self,
+        is_break: bool,
+        supersedes: bool,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        let target = {
+            let loop_ =
+                self.context_stack
+                    .current_loop()
+                    .ok_or_else(|| CompileError::NotInALoop {
+                        msg: "loop control used outside of a loop".into(),
+                        span: Some(span),
+                    })?;
+            if is_break {
+                loop_.break_label
+            } else {
+                loop_.continue_label
+            }
+        };
+        self.leave(target, supersedes, span)
     }
 
     /// Pop the loop state. Checks that the loop being ended is the same one that was expected.
@@ -592,18 +612,26 @@ impl BlockBuilder {
                 .try_into()
                 .expect("register count overflowed in finish() despite previous checks"),
             file_count: self.file_count,
+            regions: self.regions,
         })
     }
 
-    pub(crate) fn begin_try(&mut self) {
-        self.context_stack.push_try();
+    /// Record a protected `try` region. `start`/`end`/`target` are concrete instruction indices.
+    pub(crate) fn push_region(&mut self, region: TryRegion) {
+        self.regions.push(region);
     }
 
-    pub(crate) fn end_try(&mut self) -> Result<(), CompileError> {
+    /// Mark the start of compiling a `finally` block's body.
+    pub(crate) fn begin_finally_body(&mut self) {
+        self.context_stack.push_finally_body();
+    }
+
+    /// Mark the end of compiling a `finally` block's body.
+    pub(crate) fn end_finally_body(&mut self) -> Result<(), CompileError> {
         match self.context_stack.pop() {
-            Some(ContextBlock::Try) => Ok(()),
+            Some(ContextBlock::FinallyBody) => Ok(()),
             _ => Err(CompileError::NotInATry {
-                msg: "end_try() called outside of a try block".into(),
+                msg: "end_finally_body() called outside of a finally block".into(),
                 span: None,
             }),
         }
@@ -621,7 +649,9 @@ pub(crate) struct Loop {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextBlock {
     Loop(Loop),
-    Try,
+    /// The body of a `finally` block. A `break`/`continue` that crosses this to reach its loop is
+    /// leaving the finally, so it supersedes any `return`/error whose finally is running.
+    FinallyBody,
 }
 
 #[derive(Debug, Clone)]
@@ -636,8 +666,8 @@ impl ContextStack {
         self.0.push(ContextBlock::Loop(r#loop));
     }
 
-    pub fn push_try(&mut self) {
-        self.0.push(ContextBlock::Try);
+    pub fn push_finally_body(&mut self) {
+        self.0.push(ContextBlock::FinallyBody);
     }
 
     pub fn pop(&mut self) -> Option<ContextBlock> {
@@ -651,12 +681,20 @@ impl ContextStack {
         })
     }
 
-    pub fn try_block_depth_from_loop(&self) -> usize {
+    /// The blocks between here and the nearest enclosing loop, innermost first. A `break`/`continue`
+    /// unwinds these on its way to the loop.
+    fn frames_to_loop(&self) -> impl Iterator<Item = &ContextBlock> + '_ {
         self.0
             .iter()
             .rev()
-            .take_while(|&cb| matches!(cb, ContextBlock::Try))
-            .count()
+            .take_while(|cb| !matches!(cb, ContextBlock::Loop(_)))
+    }
+
+    /// Whether a `break`/`continue` leaves a `finally` block to reach its loop. If so, it supersedes
+    /// any `return`/error whose finally is currently running.
+    pub fn crosses_finally_to_loop(&self) -> bool {
+        self.frames_to_loop()
+            .any(|cb| matches!(cb, ContextBlock::FinallyBody))
     }
 
     pub fn is_in_loop(&self) -> bool {

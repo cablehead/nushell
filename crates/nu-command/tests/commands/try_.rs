@@ -353,6 +353,18 @@ fn try_exit_runs_finally() {
 }
 
 #[test]
+fn nested_exit_abandoned_in_finally_restores_outer_exit() {
+    // Inside the outer `exit 9`'s finally, a nested `exit 5` is itself abandoned (its own finally
+    // throws, caught inside the outer finally, so the outer finally completes normally). The nested
+    // exit does not take over, so the outer `exit 9` survives.
+    let actual = nu!(
+        "try { exit 9 } finally { try { try { exit 5 } finally { error make { msg: boom } } } catch {|e| null }; print 'cont' }"
+    );
+    assert!(actual.out.contains("cont"));
+    assert_eq!(actual.status.code(), Some(9));
+}
+
+#[test]
 fn try_abort_not_run_finally() {
     let actual = nu!("try { exit 3 --abort} finally { print 'this finally' }");
     assert!(!actual.out.contains("this finally"));

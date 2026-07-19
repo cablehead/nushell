@@ -2,7 +2,7 @@ use nu_protocol::{
     IntoSpanned, RegId, Span, Type, VarId,
     ast::{Block, Call, Expr, Expression},
     engine::StateWorkingSet,
-    ir::Instruction,
+    ir::{Instruction, RegionKind, TryRegion},
 };
 
 use super::{BlockBuilder, CompileError, RedirectModes, compile_block, compile_expression};
@@ -494,7 +494,6 @@ pub(crate) fn compile_try(
 
     let catch_span = catch_expr.map(|e| e.span).unwrap_or(call.head);
 
-    let err_label = builder.label(None);
     let end_label = builder.label(None);
 
     // We have two ways of executing `catch`: if it was provided as a literal, we can inline it.
@@ -547,48 +546,24 @@ pub(crate) fn compile_try(
         })
         .transpose()?;
 
-    // Put the error handler instruction. If we have a catch expression then we should capture the
-    // error.
-    let mut has_try_comment = false;
-    let mut pushed_error_handler = false;
-    if catch_type.is_some() {
-        builder.push(
-            Instruction::OnErrorInto {
-                index: err_label.0,
-                dst: io_reg,
-            }
-            .into_spanned(call.head),
-        )?;
-        builder.add_comment("try");
-        has_try_comment = true;
-        pushed_error_handler = true;
-    } else if finally_expr.is_none() {
-        // Simply try, without `catch` and `finally` block, need to set up OnErrorHandler.
-        // so `try { 1 / 0 }` works
-        builder.push(Instruction::OnError { index: err_label.0 }.into_spanned(call.head))?;
-        builder.add_comment("try");
-        has_try_comment = true;
-        pushed_error_handler = true;
-    };
+    // The region table drives control flow: nothing is pushed at runtime. We record where the
+    // `catch`/`finally` bodies live and the instruction range each protects, and the evaluator
+    // routes an error or a `leave` into them. Layout:
+    //
+    //     body_start: <body> <try-collect/drain>     ; catch region [body_start, body_end)
+    //     body_end:   leave END                      ; normal completion: run finally, goto END
+    //     catch:      <catch or load-empty> [collect] ; catch region target (reached on error)
+    //                 leave END                       ; catch completion: run finally, goto END
+    //     finally:    <finally> <move> end-finally    ; finally region target (out-of-line)
+    //     END:
+    //
+    // The catch region routes a body error to the catch; the finally region [body_start, finally)
+    // covers the body and the catch, so an error or `leave` in either runs the finally.
 
-    builder.begin_try();
+    // A `catch` region exists for a `catch` block, or for a bare `try` (which swallows the error).
+    let has_catch = catch_type.is_some() || finally_expr.is_none();
 
-    if let Some(finally_info) = &finally_type {
-        if finally_info.var_id.is_some() {
-            builder.push(
-                Instruction::FinallyInto {
-                    index: end_label.0,
-                    dst: io_reg,
-                }
-                .into_spanned(call.head),
-            )?;
-        } else {
-            builder.push(Instruction::Finally { index: end_label.0 }.into_spanned(call.head))?;
-        }
-        if !has_try_comment {
-            builder.add_comment("try");
-        }
-    }
+    let body_start = builder.here();
 
     // Compile the block
     compile_block(
@@ -600,96 +575,85 @@ pub(crate) fn compile_try(
         io_reg,
     )?;
 
-    // Successful case:
-    // - write to the current output destinations
-    // - pop the error handler
+    // Write to the current output destinations.
     if let Some(mode) = redirect_modes.out {
         builder.push(mode.map(|mode| Instruction::RedirectOut { mode }))?;
     }
-
     if let Some(mode) = redirect_modes.err {
         builder.push(mode.map(|mode| Instruction::RedirectErr { mode }))?;
     }
 
     if finally_type.is_some() || catch_type.is_some() {
-        // For `catch` clause and `finally` clause, we need to know if the `try` block
-        // runs successfully first, so we need to collect the output first to check if there
-        // is an error.
+        // With a `catch` or `finally`, collect the body first so a failing pipeline surfaces its
+        // error here (inside the protected range) instead of streaming past the `try`.
         builder.push(Instruction::TryCollect { src_dst: io_reg }.into_spanned(call.head))?;
     } else {
         builder.push(Instruction::DrainIfEnd { src: io_reg }.into_spanned(call.head))?;
     }
 
-    if pushed_error_handler {
-        builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
-    }
+    let body_end = builder.here();
 
-    builder.end_try()?;
+    // Normal completion: run the covering `finally` (if any) via the region table, then go to END.
+    builder.leave(end_label, false, catch_span)?;
 
-    // Jump over the failure case
-    builder.jump(end_label, catch_span)?;
-
-    // This is the error handler
-    builder.set_label(err_label, builder.here())?;
-
-    // Mark out register as likely not clean - state in error handler is not well defined
-    builder.mark_register(io_reg)?;
-
-    // Now compile whatever is necessary for the error handler
-    match catch_type {
-        Some(CatchType::Block { block, var_id }) => {
-            // Error will be in io_reg
-            builder.mark_register(io_reg)?;
-            if let Some(var_id) = var_id {
-                // Take a copy of the error as $err, since it will also be input
-                let err_reg = builder.next_register()?;
-                builder.push(
-                    Instruction::Clone {
-                        dst: err_reg,
-                        src: io_reg,
-                    }
-                    .into_spanned(catch_span),
-                )?;
-                builder.push(
-                    Instruction::StoreVariable {
-                        var_id,
-                        src: err_reg,
-                    }
-                    .into_spanned(catch_span),
+    // The error handler (`catch` body or bare-`try` swallow), out-of-line: reached only via the
+    // catch region on an error.
+    let mut catch_region = None;
+    if has_catch {
+        let catch_target = builder.here();
+        // State in the error handler is not well defined; mark the register as not clean.
+        builder.mark_register(io_reg)?;
+        match &catch_type {
+            Some(CatchType::Block { block, var_id }) => {
+                if let Some(var_id) = var_id {
+                    // Take a copy of the error as `$err`, since it is also the input.
+                    let err_reg = builder.next_register()?;
+                    builder.push(
+                        Instruction::Clone {
+                            dst: err_reg,
+                            src: io_reg,
+                        }
+                        .into_spanned(catch_span),
+                    )?;
+                    builder.push(
+                        Instruction::StoreVariable {
+                            var_id: *var_id,
+                            src: err_reg,
+                        }
+                        .into_spanned(catch_span),
+                    )?;
+                }
+                compile_block(
+                    working_set,
+                    builder,
+                    block,
+                    redirect_modes.clone(),
+                    Some(io_reg),
+                    io_reg,
                 )?;
             }
-            // Compile the block, now that the variable is set
-            compile_block(
-                working_set,
-                builder,
-                block,
-                redirect_modes.clone(),
-                Some(io_reg),
-                io_reg,
-            )?;
+            Some(CatchType::Closure { closure_reg }) => {
+                compile_closure_call(working_set, builder, call, io_reg, *closure_reg, catch_span)?;
+            }
+            None => {
+                // Bare `try`: swallow the error and produce empty.
+                builder.load_empty(io_reg)?;
+            }
         }
-        Some(CatchType::Closure { closure_reg }) => {
-            compile_closure_call(working_set, builder, call, io_reg, closure_reg, catch_span)?
+        if finally_type.is_some() {
+            builder.push(Instruction::TryCollect { src_dst: io_reg }.into_spanned(call.head))?;
         }
-        None => {
-            // Just set out to empty.
-            builder.load_empty(io_reg)?;
-        }
-    }
-    if finally_type.is_some() {
-        builder.push(Instruction::TryCollect { src_dst: io_reg }.into_spanned(call.head))?;
+        // Catch completion: run the covering `finally` (if any), then go to END.
+        builder.leave(end_label, false, catch_span)?;
+        catch_region = Some((catch_target, builder.here()));
     }
 
-    // This is the end - whatever we succeeded or not, should jump here for finally clause.
-    builder.set_label(end_label, builder.here())?;
-    if finally_type.is_some() {
-        builder.push(Instruction::PopFinallyRun.into_spanned(call.head))?;
-    }
-
-    // This is the finally part.
-    if let Some(finally_part) = finally_type {
-        // Preserve the value produced by `try`/`catch`: `finally` can observe it
-        // but its own pipeline result should not replace the overall `try` expression result.
+    // The `finally` body, out-of-line: reached by a `leave` or by an error via the finally region.
+    let mut finally_target = None;
+    if let Some(finally_part) = &finally_type {
+        finally_target = Some(builder.here());
+        // Preserve the value produced by `try`/`catch`: `finally` can observe it, but its own
+        // pipeline result should not replace the overall `try` expression result.
         let preserved_result_reg = builder.clone_reg(io_reg, call.head)?;
         if let Some(var_id) = finally_part.var_id {
             let value_reg = builder.clone_reg(io_reg, call.head)?;
@@ -701,6 +665,7 @@ pub(crate) fn compile_try(
                 .into_spanned(call.head),
             )?;
         }
+        builder.begin_finally_body();
         compile_block(
             working_set,
             builder,
@@ -709,6 +674,7 @@ pub(crate) fn compile_try(
             Some(io_reg),
             io_reg,
         )?;
+        builder.end_finally_body()?;
         builder.push(
             Instruction::Move {
                 dst: io_reg,
@@ -716,6 +682,36 @@ pub(crate) fn compile_try(
             }
             .into_spanned(call.head),
         )?;
+        // Resume whatever entered the finally (a pending exit), or fall through to the code after.
+        builder.push(Instruction::EndFinally.into_spanned(call.head))?;
+    }
+
+    let end_pc = builder.here();
+    builder.set_label(end_label, end_pc)?;
+
+    // Record the protected regions. A `catch` captures the error into `io_reg` (as `$err`/input); a
+    // finally with a variable receives it there too. The finally range covers the body and catch;
+    // `handler_end` bounds the out-of-line handler body (the finally body runs up to `end_pc`).
+    if let Some((catch_target, catch_end)) = catch_region {
+        builder.push_region(TryRegion {
+            start: body_start,
+            end: body_end,
+            target: catch_target,
+            handler_end: catch_end,
+            error_register: catch_type.is_some().then_some(io_reg),
+            kind: RegionKind::Catch,
+        });
+    }
+    if let Some(finally_target) = finally_target {
+        let error_register = finally_type.as_ref().and_then(|f| f.var_id).map(|_| io_reg);
+        builder.push_region(TryRegion {
+            start: body_start,
+            end: finally_target,
+            target: finally_target,
+            handler_end: end_pc,
+            error_register,
+            kind: RegionKind::Finally,
+        });
     }
 
     Ok(())
@@ -1023,19 +1019,7 @@ pub(crate) fn compile_break(
     _input_reg: Option<RegId>,
     io_reg: RegId,
 ) -> Result<(), CompileError> {
-    if !builder.is_in_loop() {
-        return Err(CompileError::NotInALoop {
-            msg: "'break' can only be used inside a loop".to_string(),
-            span: Some(call.head),
-        });
-    }
-    builder.load_empty(io_reg)?;
-    for _ in 0..builder.context_stack.try_block_depth_from_loop() {
-        builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
-    }
-    builder.push_break(call.head)?;
-    builder.add_comment("break");
-    Ok(())
+    compile_loop_exit(builder, call, io_reg, true)
 }
 
 /// Compile a call to `continue`.
@@ -1047,18 +1031,29 @@ pub(crate) fn compile_continue(
     _input_reg: Option<RegId>,
     io_reg: RegId,
 ) -> Result<(), CompileError> {
+    compile_loop_exit(builder, call, io_reg, false)
+}
+
+/// Compile a `break` (`is_break`) or `continue`: `leave` the enclosing loop, running the `finally`
+/// blocks of every `try` between here and the loop. The finallys come from the region table, so no
+/// count is needed; `supersedes` marks a `break`/`continue` that is itself leaving a `finally`.
+fn compile_loop_exit(
+    builder: &mut BlockBuilder,
+    call: &Call,
+    io_reg: RegId,
+    is_break: bool,
+) -> Result<(), CompileError> {
+    let keyword = if is_break { "break" } else { "continue" };
     if !builder.is_in_loop() {
         return Err(CompileError::NotInALoop {
-            msg: "'continue' can only be used inside a loop".to_string(),
+            msg: format!("'{keyword}' can only be used inside a loop"),
             span: Some(call.head),
         });
     }
     builder.load_empty(io_reg)?;
-    for _ in 0..builder.context_stack.try_block_depth_from_loop() {
-        builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
-    }
-    builder.push_continue(call.head)?;
-    builder.add_comment("continue");
+    let supersedes = builder.context_stack.crosses_finally_to_loop();
+    builder.push_loop_exit(is_break, supersedes, call.head)?;
+    builder.add_comment(keyword);
     Ok(())
 }
 
