@@ -151,9 +151,162 @@ interleave
 #[cfg(test)]
 mod test {
     use super::*;
+    use nu_protocol::{ByteStreamType, Signals};
+    use std::io::{self, Read};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::time::Duration;
 
     #[test]
     fn test_examples() -> nu_test_support::Result {
         nu_test_support::test().examples(Interleave)
+    }
+
+    /// Blocks in `read` until the test releases it, standing in for a socket
+    /// or a child process pipe.
+    ///
+    /// `Signals::empty()` means this stream ignores interrupts, the same as
+    /// a real child process's stdout (see `ByteStream::child()`). So if the
+    /// producer thread stops, `interleave` is the only thing that could have
+    /// stopped it. That is what makes this a test of `interleave`.
+    struct SlowReader {
+        /// Sent just before `read` blocks, so the test knows the producer
+        /// is inside the stream.
+        started: mpsc::SyncSender<()>,
+        /// `read` blocks here until the test sends (or drops) it.
+        gate: mpsc::Receiver<()>,
+    }
+
+    impl Read for SlowReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let _ = self.started.send(());
+            match self.gate.recv() {
+                // Pretend a single byte arrived.
+                Ok(()) if !buf.is_empty() => {
+                    buf[0] = b'x';
+                    Ok(1)
+                }
+                Ok(()) => Ok(0),
+                // The test dropped `gate_tx`: report EOF.
+                Err(_) => Ok(0),
+            }
+        }
+    }
+
+    /// A command whose output is a [`SlowReader`] byte stream, standing in
+    /// for an external command.
+    #[derive(Clone)]
+    struct SlowProducer {
+        started: mpsc::SyncSender<()>,
+        // `Command::run` only takes `&self`, so this is taken exactly once.
+        gate: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
+    }
+
+    impl Command for SlowProducer {
+        fn name(&self) -> &str {
+            "interleave-test-slow-producer"
+        }
+
+        fn description(&self) -> &str {
+            "Test-only: a byte stream that blocks in `read` until released."
+        }
+
+        fn signature(&self) -> Signature {
+            Signature::build("interleave-test-slow-producer")
+                .input_output_types(vec![(Type::Nothing, Type::Any)])
+        }
+
+        fn run(
+            &self,
+            _engine_state: &EngineState,
+            _stack: &mut Stack,
+            call: &Call,
+            _input: PipelineData,
+        ) -> Result<PipelineData, ShellError> {
+            let gate = self
+                .gate
+                .lock()
+                .expect("gate lock")
+                .take()
+                .expect("interleave-test-slow-producer invoked more than once");
+            let reader = SlowReader {
+                started: self.started.clone(),
+                gate,
+            };
+            let stream =
+                ByteStream::read(reader, call.head, Signals::empty(), ByteStreamType::Binary);
+            Ok(PipelineData::byte_stream(stream, None))
+        }
+    }
+
+    /// A producer blocked in its stream's `read` must stop when the pipeline
+    /// is interrupted.
+    ///
+    /// `SlowReader` sends on `started` once per `read`. The test waits for
+    /// the producer to block, interrupts, then releases the read. A second
+    /// `started` means the producer went back for more data after the
+    /// interrupt, which is the bug.
+    #[test]
+    fn producer_ignores_interrupt_while_blocked_in_inner_stream() {
+        let mut tester = nu_test_support::test();
+
+        let (started_tx, started_rx) = mpsc::sync_channel::<()>(0);
+        let (gate_tx, gate_rx) = mpsc::sync_channel::<()>(0);
+        let producer = SlowProducer {
+            started: started_tx,
+            gate: Arc::new(Mutex::new(Some(gate_rx))),
+        };
+
+        let mut working_set = StateWorkingSet::new(&tester.engine_state);
+        working_set.add_decl(Box::new(producer));
+        let delta = working_set.render();
+        tester
+            .engine_state
+            .merge_delta(delta)
+            .expect("merge_delta should succeed");
+
+        let interrupt = Arc::new(AtomicBool::new(false));
+        tester
+            .engine_state
+            .set_signals(Signals::new(interrupt.clone()));
+
+        // Buffered, so a producer that gets past `read` can send even
+        // though nothing is draining this pipeline.
+        let result = tester
+            .run_raw_with_data(
+                "interleave --buffer-size 4 { interleave-test-slow-producer }",
+                PipelineData::empty(),
+            )
+            .expect("interleave itself must return without blocking");
+
+        // Wait for the producer to block inside `read`.
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("producer thread never reached its inner stream");
+
+        // Ctrl-C, while it is blocked.
+        interrupt.store(true, Ordering::SeqCst);
+
+        // Release the read, as a real source eventually would.
+        gate_tx.send(()).expect("gate receiver still alive");
+
+        // The producer must now stop, not ask the stream for more.
+        match started_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(()) => panic!(
+                "producer asked its stream for more data after the pipeline \
+                 was interrupted"
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Stopped after the interrupt.
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Thread exited outright. Also fine.
+            }
+        }
+
+        drop(result);
     }
 }
