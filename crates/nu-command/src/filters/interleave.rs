@@ -126,10 +126,18 @@ interleave
                 stream.and_then(|stream| {
                     // Then take the stream and spawn a thread to send it to our channel
                     let tx = tx.clone();
+                    let signals = engine_state.signals().clone();
                     thread::Builder::new()
                         .name("interleave consumer".into())
                         .spawn(move || {
                             for value in stream {
+                                // Stop when the pipeline is interrupted. Otherwise
+                                // this thread only notices when it tries to send,
+                                // and a thread blocked waiting for a value never
+                                // gets there.
+                                if signals.interrupted() {
+                                    break;
+                                }
                                 if tx.send(value).is_err() {
                                     // Stop sending if the channel is dropped
                                     break;
