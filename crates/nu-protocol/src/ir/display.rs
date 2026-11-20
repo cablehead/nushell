@@ -1,4 +1,4 @@
-use super::{DataSlice, Instruction, IrBlock, Literal, RedirectMode};
+use super::{DataSlice, Instruction, IrBlock, Literal, RedirectMode, TryRegionKind};
 use crate::{DeclId, VarId, ast::Pattern, engine::EngineState};
 use std::fmt::{self};
 
@@ -43,6 +43,24 @@ impl fmt::Display for FmtIrBlock<'_> {
                 writeln!(f, "{formatted}")?;
             } else {
                 writeln!(f, "{formatted:40} # {comment}")?;
+            }
+        }
+        if !self.ir_block.try_regions.is_empty() {
+            writeln!(f, "# try regions:")?;
+            for region in &self.ir_block.try_regions {
+                let kind = match region.kind {
+                    TryRegionKind::Catch => "catch",
+                    TryRegionKind::Finally => "finally",
+                };
+                write!(
+                    f,
+                    "#   {kind:7} [{}, {}) -> [{}, {})",
+                    region.start, region.end, region.target, region.handler_end
+                )?;
+                match region.error_register {
+                    Some(reg) => writeln!(f, ", into {reg}")?,
+                    None => writeln!(f)?,
+                }
             }
         }
         Ok(())
@@ -243,8 +261,12 @@ impl fmt::Display for FmtInstruction<'_> {
             Instruction::Jump { index } => {
                 write!(f, "{:WIDTH$} {index}", "jump")
             }
-            Instruction::UnwindJump { index, handlers } => {
-                write!(f, "{:WIDTH$} {index}, handlers {handlers}", "unwind-jump")
+            Instruction::Leave { index, abrupt } => {
+                if *abrupt {
+                    write!(f, "{:WIDTH$} {index}, abrupt", "leave")
+                } else {
+                    write!(f, "{:WIDTH$} {index}", "leave")
+                }
             }
             Instruction::BranchIf { cond, index } => {
                 write!(f, "{:WIDTH$} {cond}, {index}", "branch-if")
@@ -272,21 +294,6 @@ impl fmt::Display for FmtInstruction<'_> {
                 end_index,
             } => {
                 write!(f, "{:WIDTH$} {dst}, {stream}, end {end_index}", "iterate")
-            }
-            Instruction::OnError { index } => {
-                write!(f, "{:WIDTH$} {index}", "on-error")
-            }
-            Instruction::FinallyInto { index, dst } => {
-                write!(f, "{:WIDTH$} {index}, {dst}", "finally-into")
-            }
-            Instruction::OnErrorInto { index, dst } => {
-                write!(f, "{:WIDTH$} {index}, {dst}", "on-error-into")
-            }
-            Instruction::PopErrorHandler => {
-                write!(f, "{:WIDTH$}", "pop-error-handler")
-            }
-            Instruction::BeginFinally => {
-                write!(f, "{:WIDTH$}", "begin-finally")
             }
             Instruction::EndFinally => {
                 write!(f, "{:WIDTH$}", "end-finally")

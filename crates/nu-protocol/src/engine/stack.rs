@@ -3,9 +3,9 @@ use crate::{
     PipelineMetadata, ShellError, Span, Value, VarId,
     ast::PathMember,
     engine::{
-        ArgumentStack, DEFAULT_OVERLAY_NAME, EngineState, EnvName, ErrorHandlerStack, Redirection,
-        ScopeBindings, StackCallArgGuard, StackCollectValueGuard, StackIoGuard, StackOutDest,
-        StackWithInvocation, env_var_eq,
+        ArgumentStack, DEFAULT_OVERLAY_NAME, EngineState, EnvName, Redirection, ScopeBindings,
+        StackCallArgGuard, StackCollectValueGuard, StackIoGuard, StackOutDest, StackWithInvocation,
+        env_var_eq,
     },
     ir::ScopeRegion,
     record, report_shell_warning,
@@ -166,8 +166,6 @@ pub struct Stack {
     pub active_overlays: Vec<String>,
     /// Argument stack for IR evaluation
     pub arguments: ArgumentStack,
-    /// Error handler stack for IR evaluation
-    pub error_handlers: ErrorHandlerStack,
     /// Number of nested custom command and closure calls that led to this stack.
     ///
     /// Block evaluation fails with `RecursionLimitReached` once this exceeds
@@ -223,7 +221,6 @@ impl Stack {
             env_hide_history: Arc::new(HashMap::new()),
             active_overlays: vec![DEFAULT_OVERLAY_NAME.to_string()],
             arguments: ArgumentStack::new(),
-            error_handlers: ErrorHandlerStack::new(),
             recursion_count: 0,
             parent_stack: None,
             parent_deletions: vec![],
@@ -250,7 +247,6 @@ impl Stack {
             env_hide_history: parent.env_hide_history.clone(),
             active_overlays: parent.active_overlays.clone(),
             arguments: ArgumentStack::new(),
-            error_handlers: ErrorHandlerStack::new(),
             recursion_count: parent.recursion_count,
             vars: vec![],
             parent_deletions: vec![],
@@ -777,7 +773,6 @@ impl Stack {
             env_hide_history: self.env_hide_history.clone(),
             active_overlays: self.active_overlays.clone(),
             arguments: ArgumentStack::new(),
-            error_handlers: ErrorHandlerStack::new(),
             // A closure body is a nested call like a custom command body, so it counts toward
             // the recursion limit. Stack overflows are not recoverable in Rust.
             recursion_count: self.recursion_count + 1,
@@ -825,7 +820,6 @@ impl Stack {
             env_hide_history: self.env_hide_history.clone(),
             active_overlays: self.active_overlays.clone(),
             arguments: ArgumentStack::new(),
-            error_handlers: ErrorHandlerStack::new(),
             recursion_count: self.recursion_count,
             parent_stack: Some(Arc::new(self.clone())),
             parent_deletions: vec![],

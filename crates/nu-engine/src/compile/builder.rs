@@ -1,7 +1,7 @@
 use nu_protocol::{
     CompileError, IntoSpanned, RegId, Span, Spanned,
     ast::Pattern,
-    ir::{DataSlice, Instruction, IrBlock, Literal, ScopeRegion},
+    ir::{DataSlice, Instruction, IrBlock, Literal, ScopeRegion, TryRegion},
 };
 
 /// A label identifier. Only exists while building code. Replaced with the actual target.
@@ -32,6 +32,10 @@ pub(crate) struct BlockBuilder {
     pub(crate) context_stack: ContextStack,
     /// Nested inlined-block scope regions (see [`ScopeRegion`]).
     pub(crate) scope_regions: Vec<ScopeRegion>,
+    /// Protected `try` regions (see [`TryRegion`]). Their indices are concrete instruction
+    /// indices taken with [`here()`](Self::here); [`finish()`](Self::finish) does not move
+    /// instructions, so they stay valid.
+    pub(crate) try_regions: Vec<TryRegion>,
 }
 
 impl BlockBuilder {
@@ -48,6 +52,7 @@ impl BlockBuilder {
             file_count: 0,
             context_stack: ContextStack::new(),
             scope_regions: vec![],
+            try_regions: vec![],
         }
     }
 
@@ -284,9 +289,9 @@ impl BlockBuilder {
                 ..
             } => allocate(&[*cell_path, *new_value], &[]),
             Instruction::Jump { index: _ } => Ok(()),
-            Instruction::UnwindJump {
+            Instruction::Leave {
                 index: _,
-                handlers: _,
+                abrupt: _,
             } => Ok(()),
             Instruction::BranchIf { cond, index: _ } => allocate(&[*cond], &[]),
             Instruction::BranchIfEmpty { src, index: _ } => allocate(&[*src], &[*src]),
@@ -301,11 +306,6 @@ impl BlockBuilder {
                 stream,
                 end_index: _,
             } => allocate(&[*stream], &[*dst, *stream]),
-            Instruction::OnError { index: _ } => Ok(()),
-            Instruction::OnErrorInto { index: _, dst } => allocate(&[], &[*dst]),
-            Instruction::FinallyInto { index: _, dst } => allocate(&[], &[*dst]),
-            Instruction::PopErrorHandler => Ok(()),
-            Instruction::BeginFinally => Ok(()),
             Instruction::EndFinally => Ok(()),
             Instruction::ReturnEarly { src } => allocate(&[*src], &[]),
             Instruction::Return { src } => allocate(&[*src], &[]),
@@ -536,20 +536,32 @@ impl BlockBuilder {
         self.jump_out_of_loop(loop_.continue_label, span)
     }
 
-    /// Jump to a label of the innermost loop. If the jump leaves any `try` expressions, it has
-    /// to unwind their handlers on the way, so that `finally` blocks run and no stale handler
-    /// is left behind for the rest of the loop or block.
+    /// Jump to a label of the innermost loop. If the jump leaves any part of a `try` expression,
+    /// it is a `leave`, so that the `finally` blocks it leaves run first and a pending exit whose
+    /// `finally` it leaves is abandoned. The region table says which those are.
     fn jump_out_of_loop(&mut self, label_id: LabelId, span: Span) -> Result<(), CompileError> {
-        match self.context_stack.handlers_to_unwind_for_loop() {
-            0 => self.jump(label_id, span),
-            handlers => self.push(
-                Instruction::UnwindJump {
-                    index: label_id.0,
-                    handlers,
-                }
-                .into_spanned(span),
-            ),
+        if self.context_stack.is_in_try_within_loop() {
+            self.leave(label_id, true, span)
+        } else {
+            self.jump(label_id, span)
         }
+    }
+
+    /// Add a `leave` to `label_id`: run the `finally` blocks whose region covers this point but
+    /// not the target, innermost first, then jump. `abrupt` is set for `break` and `continue`.
+    pub(crate) fn leave(
+        &mut self,
+        label_id: LabelId,
+        abrupt: bool,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        self.push(
+            Instruction::Leave {
+                index: label_id.0,
+                abrupt,
+            }
+            .into_spanned(span),
+        )
     }
 
     /// Pop the loop state. Checks that the loop being ended is the same one that was expected.
@@ -626,19 +638,25 @@ impl BlockBuilder {
                 .expect("register count overflowed in finish() despite previous checks"),
             file_count: self.file_count,
             scope_regions: self.scope_regions,
+            try_regions: self.try_regions,
         })
     }
 
-    /// Enter a region of a `try` expression (its body, `catch` block, or `finally` block) that
-    /// keeps `handlers` entries on the runtime handler stack while it runs. Must be paired with
+    /// Record a protected `try` region.
+    pub(crate) fn push_try_region(&mut self, region: TryRegion) {
+        self.try_regions.push(region);
+    }
+
+    /// Enter a part of a `try` expression (its body, `catch` block, or `finally` block). A
+    /// `break` or `continue` inside it has to `leave` rather than `jump`. Must be paired with
     /// [`end_try()`](Self::end_try).
-    pub(crate) fn begin_try(&mut self, handlers: usize) {
-        self.context_stack.push_try(handlers);
+    pub(crate) fn begin_try(&mut self) {
+        self.context_stack.push_try();
     }
 
     pub(crate) fn end_try(&mut self) -> Result<(), CompileError> {
         match self.context_stack.pop() {
-            Some(ContextBlock::Try { .. }) => Ok(()),
+            Some(ContextBlock::Try) => Ok(()),
             _ => Err(CompileError::NotInATry {
                 msg: "end_try() called outside of a try block".into(),
                 span: None,
@@ -658,11 +676,8 @@ pub(crate) struct Loop {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextBlock {
     Loop(Loop),
-    /// A region of a `try` expression, with the number of entries it keeps on the runtime
-    /// handler stack while the region runs.
-    Try {
-        handlers: usize,
-    },
+    /// A part of a `try` expression: its body, `catch` block, or `finally` block.
+    Try,
 }
 
 #[derive(Debug, Clone)]
@@ -677,8 +692,8 @@ impl ContextStack {
         self.0.push(ContextBlock::Loop(r#loop));
     }
 
-    pub fn push_try(&mut self, handlers: usize) {
-        self.0.push(ContextBlock::Try { handlers });
+    pub fn push_try(&mut self) {
+        self.0.push(ContextBlock::Try);
     }
 
     pub fn pop(&mut self) -> Option<ContextBlock> {
@@ -692,17 +707,10 @@ impl ContextStack {
         })
     }
 
-    /// The number of runtime handler stack entries that a jump to the innermost loop's labels
-    /// has to unwind through, i.e. the handlers of every `try` region between here and the loop.
-    pub fn handlers_to_unwind_for_loop(&self) -> usize {
-        self.0
-            .iter()
-            .rev()
-            .map_while(|cb| match cb {
-                ContextBlock::Try { handlers } => Some(*handlers),
-                ContextBlock::Loop(_) => None,
-            })
-            .sum()
+    /// Whether any part of a `try` expression lies between here and the innermost loop, so that
+    /// a jump to the loop's labels leaves it.
+    pub fn is_in_try_within_loop(&self) -> bool {
+        matches!(self.0.last(), Some(ContextBlock::Try))
     }
 
     pub fn is_in_loop(&self) -> bool {
