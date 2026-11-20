@@ -387,6 +387,20 @@ fn try_exit_runs_finally() -> Result {
 
 #[test]
 #[deps(NU)]
+fn nested_exit_abandoned_in_finally_restores_outer_exit() -> Result {
+    // From cablehead/nushell finally-region-table: inside the outer `exit 9`'s finally, a nested
+    // `exit 5` is abandoned (its own finally throws, caught inside the outer finally), so the
+    // outer `exit 9` survives.
+    let code = "try { exit 9 } finally { try { try { exit 5 } finally { error make { msg: boom } } } catch {|e| null }; print 'cont' }";
+    let result: CompleteResult =
+        test().run_with_data("let code; nu -n -c $code | complete", code)?;
+    assert_contains("cont", &result.stdout);
+    assert_eq!(result.exit_code, 9);
+    Ok(())
+}
+
+#[test]
+#[deps(NU)]
 fn try_abort_not_run_finally() -> Result {
     let code = "try { exit 3 --abort} finally { print 'this finally' }";
     let result: CompleteResult =
