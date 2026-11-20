@@ -2,7 +2,7 @@ use nu_protocol::{
     IntoSpanned, RegId, Span, Type, VarId,
     ast::{Block, Call, Expr, Expression},
     engine::StateWorkingSet,
-    ir::Instruction,
+    ir::{Instruction, TryRegion, TryRegionKind},
 };
 
 use super::{BlockBuilder, CompileError, RedirectModes, compile_block, compile_expression};
@@ -433,46 +433,49 @@ pub(crate) fn compile_try(
     io_reg: RegId,
 ) -> Result<(), CompileError> {
     // Pseudocode (literal block). Instructions marked with a condition are only emitted when
-    // the corresponding clause is present. Handlers are pushed outermost first, so that an
-    // error in the body reaches `catch` before `finally`:
+    // the corresponding clause is present. Nothing is pushed at runtime: the `catch` and
+    // `finally` bodies are out of line, and the regions recorded at the end route control to
+    // them.
     //
-    //       finally-into  FINALLY, %io_reg          // `finally`
-    //       on-error-into ERR, %io_reg              // `catch` (`on-error ERR` when there is neither)
-    //       %io_reg <- <...block...> <- %io_reg
-    //       try-collect %io_reg                     // `drain-if-end` when there is neither
-    //       pop-error-handler                       // `catch`, or neither
-    //       begin-finally                           // `finally`
-    //       jump FINALLY                            // `catch`, or neither (`jump END` without `finally`)
-    // ERR:  clone %err_reg, %io_reg                 // `catch` with a parameter
-    //       store-variable $err_var, %err_reg
-    //       %io_reg <- <...catch block...> <- %io_reg // set to empty if there is neither
-    //       try-collect %io_reg                     // `finally`
-    //       begin-finally                           // `finally`
-    // FINALLY:                                      // `finally`; unwinding jumps here as well
-    //       move %result_reg, %io_reg
-    //       clone %io_reg, %result_reg
-    //       store-variable $finally_var, %io_reg    // `finally` with a parameter (via a clone)
-    //       %io_reg <- <...finally block...> <- %io_reg
-    //       move %io_reg, %result_reg
-    //       end-finally
+    // BODY:    %io_reg <- <...block...> <- %io_reg
+    //          try-collect %io_reg                 // `drain-if-end` when there is neither
+    //          leave END                           // `finally` (`jump END` without it)
+    // CATCH:   clone %err_reg, %io_reg             // `catch` with a parameter
+    //          store-variable $err_var, %err_reg
+    //          %io_reg <- <...catch block...> <- %io_reg // set to empty if there is neither
+    //          try-collect %io_reg                 // `finally`
+    //          leave END                           // `finally`
+    // FINALLY: move %result_reg, %io_reg           // `finally`
+    //          clone %io_reg, %result_reg
+    //          store-variable $finally_var, %io_reg // `finally` with a parameter (via a clone)
+    //          %io_reg <- <...finally block...> <- %io_reg
+    //          move %io_reg, %result_reg
+    //          end-finally
     // END:
     //
-    // with a catch expression that can't be inlined, the ERR section becomes:
+    // with the regions
+    //
+    //     catch   [BODY, CATCH)   -> CATCH, into %io_reg (no register without a catch block)
+    //     finally [BODY, FINALLY) -> FINALLY, into %io_reg
+    //
+    // An error in the body finds the `catch` region first (it is the smaller one). The `finally`
+    // region covers the body and the `catch`, so an error in either runs `finally`, and so does
+    // each `leave`, as it leaves the region. `end-finally` resumes whatever entered `finally`.
+    //
+    // with a catch expression that can't be inlined, the CATCH section becomes:
     //
     //       push-positional %closure_reg
     //       push-positional %err_reg
     //       call "do", %io_reg
     //
-    // where %closure_reg was evaluated before the handlers were pushed.
+    // where %closure_reg was evaluated before BODY.
     //
     // `try-collect` leaves an external whose stderr has its own pipe (the next command is
     // `complete`, `ignore`, `save` or `tee`) as a stream. %result_reg keeps that stream, so the
     // next command still gets its stderr, and `clone` gives `finally` its stdout as a value.
     //
-    // At runtime, `begin-finally` swaps the `finally` handler for a "running" marker, and
-    // `end-finally` pops that marker. When control unwinds into the `finally` block instead (an
-    // error, `return`, `exit`, `break`, or `continue`), the evaluator does the swap itself and
-    // resumes the unwinding at `end-finally`.
+    // When unwinding enters `finally` (an error, `return`, `exit`, `break`, or `continue`), the
+    // evaluator first puts the error, or empty, into %io_reg.
     let invalid = || CompileError::InvalidKeywordCall {
         keyword: "try".into(),
         span: call.head,
@@ -510,8 +513,6 @@ pub(crate) fn compile_try(
 
     let catch_span = catch_expr.map(|e| e.span).unwrap_or(call.head);
 
-    let err_label = builder.label(None);
-    let finally_label = builder.label(None);
     let end_label = builder.label(None);
 
     // We have two ways of executing `catch`: if it was provided as a literal, we can inline it.
@@ -564,42 +565,15 @@ pub(crate) fn compile_try(
         })
         .transpose()?;
 
+    let catch_type_has_register = catch_type.is_some();
     let has_finally = finally_type.is_some();
-    // A plain `try { }` still needs an error handler so that `try { 1 / 0 }` swallows the error.
+    // A plain `try { }` still needs a `catch` region so that `try { 1 / 0 }` swallows the error.
     // `try { } finally { }` does not: the error is meant to propagate after `finally` runs.
-    let pushed_error_handler = catch_type.is_some() || !has_finally;
+    let has_catch_region = catch_type.is_some() || !has_finally;
 
-    // Push the handlers. `finally` always captures into `io_reg` so that the register holds a
-    // well-defined value (the error, or empty) when unwinding enters the block.
-    if has_finally {
-        builder.push(
-            Instruction::FinallyInto {
-                index: finally_label.0,
-                dst: io_reg,
-            }
-            .into_spanned(call.head),
-        )?;
-        builder.add_comment("try");
-    }
-    if pushed_error_handler {
-        if catch_type.is_some() {
-            builder.push(
-                Instruction::OnErrorInto {
-                    index: err_label.0,
-                    dst: io_reg,
-                }
-                .into_spanned(call.head),
-            )?;
-        } else {
-            builder.push(Instruction::OnError { index: err_label.0 }.into_spanned(call.head))?;
-        }
-        if !has_finally {
-            builder.add_comment("try");
-        }
-    }
-
-    // Compile the block. Both handlers are live while it runs.
-    builder.begin_try(usize::from(has_finally) + usize::from(pushed_error_handler));
+    // Compile the block.
+    let body_start = builder.here();
+    builder.begin_try();
     compile_block(
         working_set,
         builder,
@@ -610,9 +584,7 @@ pub(crate) fn compile_try(
         io_reg,
     )?;
 
-    // Successful case:
-    // - write to the current output destinations
-    // - pop the error handler
+    // Successful case: write to the current output destinations
     if let Some(mode) = redirect_modes.out {
         builder.push(mode.map(|mode| Instruction::RedirectOut { mode }))?;
     }
@@ -629,35 +601,24 @@ pub(crate) fn compile_try(
     } else {
         builder.push(Instruction::DrainIfEnd { src: io_reg }.into_spanned(call.head))?;
     }
-
-    if pushed_error_handler {
-        builder.push(Instruction::PopErrorHandler.into_spanned(call.head))?;
-    }
     builder.end_try()?;
+    let body_end = builder.here();
 
+    // Leave the body: through `finally` if there is one, otherwise over the `catch` block.
     if has_finally {
-        builder.push(Instruction::BeginFinally.into_spanned(call.head))?;
+        builder.leave(end_label, false, catch_span)?;
+    } else {
+        builder.jump(end_label, catch_span)?;
     }
 
-    if pushed_error_handler {
-        // Jump over the error handler
-        builder.jump(
-            if has_finally {
-                finally_label
-            } else {
-                end_label
-            },
-            catch_span,
-        )?;
-
-        // This is the error handler
-        builder.set_label(err_label, builder.here())?;
+    // This is the error handler, reached only through the `catch` region.
+    let catch_body = if has_catch_region {
+        let catch_start = builder.here();
 
         // Mark out register as likely not clean - state in error handler is not well defined
         builder.mark_register(io_reg)?;
 
-        // The error handler was popped on the way here, but the `finally` handler still stands.
-        builder.begin_try(usize::from(has_finally));
+        builder.begin_try();
         match catch_type {
             Some(CatchType::Block { block, var_id }) => {
                 if let Some(var_id) = var_id {
@@ -697,22 +658,25 @@ pub(crate) fn compile_try(
                 builder.load_empty(io_reg)?;
             }
         }
-        builder.end_try()?;
 
         if has_finally {
             // `finally` must not start until the `catch` block has finished producing its output.
             builder.push(Instruction::TryCollect { src_dst: io_reg }.into_spanned(call.head))?;
-            builder.push(Instruction::BeginFinally.into_spanned(call.head))?;
         }
-    }
+        builder.end_try()?;
+        if has_finally {
+            builder.leave(end_label, false, catch_span)?;
+        }
+        Some((catch_start, builder.here()))
+    } else {
+        None
+    };
 
-    // This is the finally part. Whether we succeeded or not, control ends up here.
-    if let Some(finally_part) = finally_type {
-        builder.set_label(finally_label, builder.here())?;
+    // This is the finally part, reached by a `leave` or by unwinding through the `finally` region.
+    let finally_body = if let Some(finally_part) = finally_type {
+        let finally_start = builder.here();
         builder.mark_register(io_reg)?;
-
-        // Only the running marker of this `finally` is on the handler stack while it runs.
-        builder.begin_try(1);
+        builder.begin_try();
 
         // Preserve the value produced by `try`/`catch`: `finally` can observe a copy of it
         // but its own pipeline result should not replace the overall `try` expression result.
@@ -759,10 +723,38 @@ pub(crate) fn compile_try(
             .into_spanned(call.head),
         )?;
         builder.end_try()?;
+        // Resume whatever entered `finally`.
         builder.push(Instruction::EndFinally.into_spanned(call.head))?;
-    }
+        Some((finally_start, builder.here()))
+    } else {
+        None
+    };
 
     builder.set_label(end_label, builder.here())?;
+
+    // Record the regions. `catch` captures the error into `io_reg` (as `$err` and as input). The
+    // `finally` region covers the body and the `catch`, and always uses `io_reg`, so that the
+    // register holds a well-defined value (the error, or empty) when unwinding enters the block.
+    if let Some((target, handler_end)) = catch_body {
+        builder.push_try_region(TryRegion {
+            start: body_start,
+            end: body_end,
+            target,
+            handler_end,
+            error_register: catch_type_has_register.then_some(io_reg),
+            kind: TryRegionKind::Catch,
+        });
+    }
+    if let Some((target, handler_end)) = finally_body {
+        builder.push_try_region(TryRegion {
+            start: body_start,
+            end: target,
+            target,
+            handler_end,
+            error_register: Some(io_reg),
+            kind: TryRegionKind::Finally,
+        });
+    }
 
     Ok(())
 }
@@ -975,11 +967,6 @@ pub(crate) fn compile_for(
         keyword: "for".into(),
         span: call.head,
     };
-
-    if call.get_named_arg("numbered").is_some() {
-        // This is deprecated and we don't support it.
-        return Err(invalid());
-    }
 
     let (var_decl_arg, in_arg, block_arg) = Some(call.positional_iter())
         .and_then(|mut iter| Some((iter.next()?, iter.next()?, iter.next()?)))

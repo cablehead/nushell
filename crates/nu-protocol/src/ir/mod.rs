@@ -47,6 +47,52 @@ pub struct IrBlock {
     /// Not serialized — only meaningful in the process that compiled the block.
     #[serde(skip)]
     pub scope_regions: Vec<ScopeRegion>,
+    /// Protected `try` regions, which drive `catch` and `finally` (see [`TryRegion`]).
+    ///
+    /// Nothing is pushed or popped at runtime: each `try` records, at compile time, the
+    /// instruction range it protects and where its `catch` or `finally` body lives. When an
+    /// error or a structured exit ([`Instruction::Leave`], [`Instruction::ReturnEarly`]) unwinds,
+    /// the evaluator looks up the regions covering the current instruction.
+    pub try_regions: Vec<TryRegion>,
+}
+
+/// A protected `try` region and the `catch` or `finally` body it routes to.
+///
+/// Regions nest by containment, so the innermost region covering an instruction is the smallest
+/// one around it. A `try`'s `catch` region covers only its body, while its `finally` region covers
+/// the body and the `catch`, so the `catch` is always found before its own `finally`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TryRegion {
+    /// First protected instruction index (inclusive).
+    pub start: usize,
+    /// One past the last protected instruction index (exclusive).
+    pub end: usize,
+    /// Instruction index of the `catch` or `finally` body this region transfers to.
+    pub target: usize,
+    /// One past the last instruction of the `catch` or `finally` body (exclusive). The body
+    /// occupies `[target, handler_end)`. While a `finally` runs for a pending exit, control that
+    /// leaves this range other than through its `end-finally` abandons that exit.
+    pub handler_end: usize,
+    /// Register that receives the error (or empty, or the `try` value) on entry to the body.
+    /// `None` when nothing is bound.
+    pub error_register: Option<RegId>,
+    /// Whether this region catches an error or always runs on the way out.
+    pub kind: TryRegionKind,
+}
+
+impl TryRegion {
+    /// Whether the protected range covers instruction `index`.
+    pub fn covers(&self, index: usize) -> bool {
+        self.start <= index && index < self.end
+    }
+}
+
+/// Whether a [`TryRegion`] is a `catch` (handles an error, stopping it) or a `finally` (runs on
+/// every exit, after which the pending exit continues).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TryRegionKind {
+    Catch,
+    Finally,
 }
 
 impl fmt::Debug for IrBlock {
@@ -59,6 +105,7 @@ impl fmt::Debug for IrBlock {
             .field("register_count", &self.register_count)
             .field("file_count", &self.file_count)
             .field("scope_regions", &self.scope_regions.len())
+            .field("try_regions", &self.try_regions)
             .finish()
     }
 }
@@ -279,27 +326,17 @@ pub enum Instruction {
         stream: RegId,
         end_index: usize,
     },
-    /// Jump to an offset in this block, unwinding through `handlers` entries of the `try`
-    /// handler stack first. This is how `break` and `continue` leave `try` expressions: any
-    /// `finally` block among those handlers runs before the jump completes.
-    UnwindJump { index: usize, handlers: usize },
-    /// Push a `catch` handler, without capturing the error value
-    OnError { index: usize },
-    /// Push a `catch` handler, capturing the error value into `dst`. If the error handler is not
-    /// called, the register should be freed manually.
-    OnErrorInto { index: usize, dst: RegId },
-    /// Push a `finally` handler, capturing the error value into `dst`. If the handler is entered
-    /// for any other reason than an error, `dst` is set to empty instead.
-    FinallyInto { index: usize, dst: RegId },
-    /// Pop a `catch` handler. This is not necessary when control flow is directed to the error
-    /// handler due to an error.
-    PopErrorHandler,
-    /// Mark the `finally` handler on top of the handler stack as running, on the way into its
-    /// block from the `try`/`catch` fall-through path. The unwinder does this itself when it
-    /// enters a `finally` block, so `index` of `finally` points just past this instruction.
-    BeginFinally,
-    /// Leave a `finally` block: pops its running marker and, if the block was entered by
-    /// unwinding (an error, `return`, `exit`, `break`, or `continue`), resumes that unwinding.
+    /// Structured exit that runs pending `finally` blocks before jumping. Used when a `try` body
+    /// or `catch` completes normally, and for `break` and `continue` out of a `try`. Runs every
+    /// `finally` whose region (in [`IrBlock::try_regions`]) covers this instruction but not
+    /// `index`, innermost first, then jumps to `index`.
+    ///
+    /// `abrupt` is set for `break` and `continue`: each `finally` then sees empty as its input,
+    /// as it does for `return` or an error, instead of the value the `try` produced.
+    Leave { index: usize, abrupt: bool },
+    /// Marks the end of an out-of-line `finally` block. Resumes the exit that entered the block:
+    /// runs the next enclosing `finally`, or performs the pending jump, return or error once none
+    /// remain.
     EndFinally,
     /// Return early from the block with the value in the register.
     ///
@@ -374,17 +411,12 @@ impl Instruction {
             Instruction::UpsertCellPath { src_dst, .. } => Some(src_dst),
             Instruction::UpdateVarCellPath { .. } => None,
             Instruction::Jump { .. } => None,
-            Instruction::UnwindJump { .. } => None,
             Instruction::BranchIf { .. } => None,
             Instruction::BranchIfEmpty { .. } => None,
             Instruction::Match { .. } => None,
             Instruction::CheckMatchGuard { .. } => None,
             Instruction::Iterate { dst, .. } => Some(dst),
-            Instruction::OnError { .. } => None,
-            Instruction::OnErrorInto { .. } => None,
-            Instruction::FinallyInto { .. } => None,
-            Instruction::PopErrorHandler => None,
-            Instruction::BeginFinally => None,
+            Instruction::Leave { .. } => None,
             Instruction::EndFinally => None,
             Instruction::ReturnEarly { .. } => None,
             Instruction::Return { .. } => None,
@@ -395,7 +427,7 @@ impl Instruction {
     pub fn branch_target(&self) -> Option<usize> {
         match self {
             Instruction::Jump { index } => Some(*index),
-            Instruction::UnwindJump { index, handlers: _ } => Some(*index),
+            Instruction::Leave { index, abrupt: _ } => Some(*index),
             Instruction::BranchIf { cond: _, index } => Some(*index),
             Instruction::BranchIfEmpty { src: _, index } => Some(*index),
             Instruction::Match {
@@ -409,9 +441,6 @@ impl Instruction {
                 stream: _,
                 end_index,
             } => Some(*end_index),
-            Instruction::OnError { index } => Some(*index),
-            Instruction::OnErrorInto { index, dst: _ } => Some(*index),
-            Instruction::FinallyInto { index, dst: _ } => Some(*index),
             _ => None,
         }
     }
@@ -422,7 +451,7 @@ impl Instruction {
     pub fn set_branch_target(&mut self, target_index: usize) -> Result<(), usize> {
         match self {
             Instruction::Jump { index } => *index = target_index,
-            Instruction::UnwindJump { index, handlers: _ } => *index = target_index,
+            Instruction::Leave { index, abrupt: _ } => *index = target_index,
             Instruction::BranchIf { cond: _, index } => *index = target_index,
             Instruction::BranchIfEmpty { src: _, index } => *index = target_index,
             Instruction::Match {
@@ -436,9 +465,6 @@ impl Instruction {
                 stream: _,
                 end_index,
             } => *end_index = target_index,
-            Instruction::OnError { index } => *index = target_index,
-            Instruction::OnErrorInto { index, dst: _ } => *index = target_index,
-            Instruction::FinallyInto { index, dst: _ } => *index = target_index,
             _ => return Err(target_index),
         }
         Ok(())
@@ -451,9 +477,9 @@ impl Instruction {
         span: &Span,
     ) -> Result<(), ShellError> {
         match self {
-            Instruction::Jump { .. }
-            | Instruction::UnwindJump { .. }
-            | Instruction::Return { .. } => engine_state.signals().check(span),
+            Instruction::Jump { .. } | Instruction::Leave { .. } | Instruction::Return { .. } => {
+                engine_state.signals().check(span)
+            }
             _ => Ok(()),
         }
     }

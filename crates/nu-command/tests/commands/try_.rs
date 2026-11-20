@@ -387,6 +387,20 @@ fn try_exit_runs_finally() -> Result {
 
 #[test]
 #[deps(NU)]
+fn nested_exit_abandoned_in_finally_restores_outer_exit() -> Result {
+    // From cablehead/nushell finally-region-table: inside the outer `exit 9`'s finally, a nested
+    // `exit 5` is abandoned (its own finally throws, caught inside the outer finally), so the
+    // outer `exit 9` survives.
+    let code = "try { exit 9 } finally { try { try { exit 5 } finally { error make { msg: boom } } } catch {|e| null }; print 'cont' }";
+    let result: CompleteResult =
+        test().run_with_data("let code; nu -n -c $code | complete", code)?;
+    assert_contains("cont", &result.stdout);
+    assert_eq!(result.exit_code, 9);
+    Ok(())
+}
+
+#[test]
+#[deps(NU)]
 fn try_abort_not_run_finally() -> Result {
     let code = "try { exit 3 --abort} finally { print 'this finally' }";
     let result: CompleteResult =
@@ -928,19 +942,23 @@ fn failing_external_piped_to_ignore_still_runs_catch() -> Result {
 
 #[test]
 #[deps(TESTBIN_ECHO_ENV_MIXED)]
-fn try_with_catch_passes_external_to_save_stderr() -> Result {
-    Playground::setup("try_catch_save_stderr", |dirs, _sandbox| {
-        let code = "
-            $env.OUT = 'out'
-            $env.ERR = 'err'
-            try { echo_env_mixed out-err OUT ERR } catch { 'catch' } | save -r out.txt --stderr err.txt
-        ";
+fn try_with_catch_passes_external_to_save_stderr(playground: Playground) -> Result {
+    let code = "
+        $env.OUT = 'out'
+        $env.ERR = 'err'
+        try { echo_env_mixed out-err OUT ERR } catch { 'catch' } | save -r out.txt --stderr err.txt
+    ";
 
-        let () = test().cwd(dirs.test()).run(code)?;
-        assert_eq!(fs::read_to_string(dirs.test().join("out.txt"))?, "out\n");
-        assert_eq!(fs::read_to_string(dirs.test().join("err.txt"))?, "err\n");
-        Ok(())
-    })
+    let () = test().cwd(playground.path()).run(code)?;
+    assert_eq!(
+        fs::read_to_string(playground.path().join("out.txt"))?,
+        "out\n"
+    );
+    assert_eq!(
+        fs::read_to_string(playground.path().join("err.txt"))?,
+        "err\n"
+    );
+    Ok(())
 }
 
 /// `finally` gets what the stdout collects to, while the stream goes on with stdout and stderr.
@@ -1007,16 +1025,15 @@ fn try_pipefail_does_not_hang_on_big_output(
 #[nu_test_support::test]
 #[exp(PIPE_FAIL)]
 #[deps(TESTBIN_COCOCO, TESTBIN_ECHO_ENV_STDERR_FAIL)]
-fn try_runs_later_steps_as_their_output_is_read(#[case] code: &str, #[case] runs: &str) -> Result {
-    Playground::setup(
-        "try_runs_later_steps_as_their_output_is_read",
-        |dirs, _sandbox| {
-            let _: Value = test().cwd(dirs.test()).run(code)?;
-            let log = fs::read_to_string(dirs.test().join("log.txt")).unwrap_or_default();
-            assert_eq!(log, runs);
-            Ok(())
-        },
-    )
+fn try_runs_later_steps_as_their_output_is_read(
+    #[ignore] playground: Playground,
+    #[case] code: &str,
+    #[case] runs: &str,
+) -> Result {
+    let _: Value = test().cwd(playground.path()).run(code)?;
+    let log = fs::read_to_string(playground.path().join("log.txt")).unwrap_or_default();
+    assert_eq!(log, runs);
+    Ok(())
 }
 
 /// A plain `try` doesn't wait for the externals of a stream it hands on: they may only exit once
@@ -1064,15 +1081,16 @@ fn failing_external_stderr_is_shown_when_try_takes_over(#[case] child_code: &str
 
 #[test]
 #[deps(TESTBIN_ECHO_ENV_STDERR_FAIL)]
-fn failing_external_stderr_follows_stderr_redirection() -> Result {
-    Playground::setup("try_catch_failed_stderr_redirect", |dirs, _sandbox| {
-        let code = "
-            $env.ERR = 'boom'
-            do { try { echo_env_stderr_fail ERR } catch { 'catch' } | ignore } e> err.txt
-        ";
+fn failing_external_stderr_follows_stderr_redirection(playground: Playground) -> Result {
+    let code = "
+        $env.ERR = 'boom'
+        do { try { echo_env_stderr_fail ERR } catch { 'catch' } | ignore } e> err.txt
+    ";
 
-        let () = test().cwd(dirs.test()).run(code)?;
-        assert_eq!(fs::read_to_string(dirs.test().join("err.txt"))?, "boom\n");
-        Ok(())
-    })
+    let () = test().cwd(playground.path()).run(code)?;
+    assert_eq!(
+        fs::read_to_string(playground.path().join("err.txt"))?,
+        "boom\n"
+    );
+    Ok(())
 }

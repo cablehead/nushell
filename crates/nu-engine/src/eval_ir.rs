@@ -11,10 +11,13 @@ use nu_protocol::{
     combined_type_string,
     debugger::{DebugContext, WithDebug, WithoutDebug},
     engine::{
-        Argument, Closure, EngineState, EnvName, ErrorHandler, Matcher, Redirection, Stack,
-        StateWorkingSet, TryHandler, env_var_eq,
+        Argument, Closure, EngineState, EnvName, Matcher, Redirection, Stack, StateWorkingSet,
+        env_var_eq,
     },
-    ir::{Call, DataSlice, Instruction, IrBlock, Literal, RedirectMode},
+    ir::{
+        Call, CallBuilder, DataSlice, Instruction, IrBlock, Literal, RedirectMode, TryRegion,
+        TryRegionKind,
+    },
     shell_error::{
         eval_block_with_input::EvalBlockWithInputError, generic::GenericError, io::IoError,
     },
@@ -103,7 +106,6 @@ fn eval_ir_block_inner<D: DebugContext>(
         stack.ir_instruction_index = None;
 
         let args_base = stack.arguments.get_base();
-        let error_handler_base = stack.error_handlers.get_base();
 
         // Allocate and initialize registers. I've found that it's not really worth trying to avoid
         // the heap allocation here by reusing buffers - our allocator is fast enough
@@ -115,6 +117,8 @@ fn eval_ir_block_inner<D: DebugContext>(
         // Initialize file storage.
         let mut files = vec![None; ir_block.file_count as usize];
 
+        let mut record_items = vec![Vec::new(); ir_block.register_count as usize];
+
         let result = eval_ir_block_impl::<D>(
             &mut EvalContext {
                 engine_state,
@@ -122,19 +126,17 @@ fn eval_ir_block_inner<D: DebugContext>(
                 data: &ir_block.data,
                 block_span: &block.span,
                 args_base,
-                error_handler_base,
-                finally_resumes: vec![],
                 redirect_out: None,
                 redirect_err: None,
                 matches: vec![],
                 registers: &mut registers[..],
                 files: &mut files[..],
+                record_items: &mut record_items[..],
             },
             ir_block,
             input,
         );
 
-        stack.error_handlers.leave_frame(error_handler_base);
         stack.arguments.leave_frame(args_base);
         stack.ir_instruction_index = None;
 
@@ -174,13 +176,6 @@ struct EvalContext<'a> {
     block_span: &'a Option<Span>,
     /// Base index on the argument stack to reset to after a call
     args_base: usize,
-    /// Base index on the error handler stack to reset to after a call
-    error_handler_base: usize,
-    /// One entry per `finally` block that is currently running in this frame (innermost last):
-    /// the control flow it interrupted and has to resume at `end-finally`, or `None` if it was
-    /// entered by falling through from `try`/`catch`. Mirrors the [`TryHandler::RunningFinally`]
-    /// markers on the handler stack.
-    finally_resumes: Vec<Option<Unwind>>,
     /// State set by redirect-out
     redirect_out: Option<Redirection>,
     /// State set by redirect-err
@@ -191,9 +186,48 @@ struct EvalContext<'a> {
     registers: &'a mut [PipelineExecutionData],
     /// Holds open files used by redirections
     files: &'a mut [Option<Arc<File>>],
+    /// The items added so far to the record literal being built in each register. Used to point
+    /// duplicate-key errors at the item that brought the key in.
+    record_items: &'a mut [Vec<RecordLiteralItem>],
+}
+
+/// One item of a record literal under construction: a `key: value` pair or a spread.
+#[derive(Clone, Copy)]
+struct RecordLiteralItem {
+    /// Length of the record after this item was added. Records keep insertion order, so this is
+    /// enough to tell which item added the key at a given index.
+    end: usize,
+    /// The source of the item: `key: value`, `...expr`, or a table cell. Used for the
+    /// "field first defined here" label.
+    span: Span,
+    /// Whether the item was a spread. A duplicate of a key it added gets the spread help.
+    is_spread: bool,
 }
 
 impl<'a> EvalContext<'a> {
+    /// Find the item that added `key` to the record literal being built in `reg`.
+    fn record_item_of_key(
+        &self,
+        reg: RegId,
+        record: &Record,
+        key: &str,
+    ) -> Option<RecordLiteralItem> {
+        let index = record.index_of(key)?;
+        let items = &self.record_items[reg.get() as usize];
+        items
+            .get(items.partition_point(|item| item.end <= index))
+            .copied()
+    }
+
+    /// Remember the item that was just added to the record literal being built in `reg`.
+    fn push_record_item(&mut self, reg: RegId, end: usize, span: Span, is_spread: bool) {
+        self.record_items[reg.get() as usize].push(RecordLiteralItem {
+            end,
+            span,
+            is_spread,
+        });
+    }
+
     /// Replace the contents of a register with a new value
     #[inline]
     fn put_reg(&mut self, reg_id: RegId, new_value: PipelineExecutionData) {
@@ -289,6 +323,10 @@ fn eval_ir_block_impl<D: DebugContext>(
     let mut pc = 0;
     let need_backtrace = ctx.engine_state.get_env_var("NU_BACKTRACE").is_some();
 
+    // The exit in flight whose `finally` block is running, if any, chained to the exits it was
+    // raised inside of. See [`PendingExit`].
+    let mut pending: Option<Box<PendingExit>> = None;
+
     while pc < ir_block.instructions.len() {
         let instruction = &ir_block.instructions[pc];
         let span = &ir_block.spans[pc];
@@ -309,9 +347,10 @@ fn eval_ir_block_impl<D: DebugContext>(
             result.as_ref().err(),
         );
 
-        // Control flow that leaves the current `try` body goes through `unwind`, which runs the
-        // handlers in order and either lands on one of them or leaves the block.
-        let unwind = match result {
+        // Control flow that leaves part of a `try` goes through `unwind`, which runs the
+        // `finally` blocks it leaves, in order, and then lands on its target or leaves the block.
+        let regions = &ir_block.try_regions;
+        let step = match result {
             Ok(InstructionResult::Continue) => {
                 pc += 1;
                 continue;
@@ -324,34 +363,76 @@ fn eval_ir_block_impl<D: DebugContext>(
             Ok(InstructionResult::ReturnEarly(reg_id)) => {
                 // The data is flagged as an early return. The nearest custom command or closure
                 // call clears that flag; top-level file evaluation reads it to skip `main`.
-                Unwind::Return(ctx.take_reg(reg_id).with_early_return())
-            }
-            Ok(InstructionResult::UnwindJump { index, handlers }) => {
-                Unwind::Jump { index, handlers }
-            }
-            Ok(InstructionResult::EndFinally) => {
-                match ctx.stack.error_handlers.pop(ctx.error_handler_base) {
-                    Some(TryHandler::RunningFinally) => {}
-                    handler => {
-                        return Err(ShellError::IrEvalError {
-                            msg: format!(
-                                "end-finally expected a running finally handler, found {handler:?}"
-                            ),
-                            span: Some(*span),
-                        });
+                let covering = covering(regions, pc);
+                let Some(first) = covering
+                    .iter()
+                    .position(|region| region.kind == TryRegionKind::Finally)
+                else {
+                    // No `finally` to run: keep streams and metadata intact.
+                    return Ok(ctx.take_reg(reg_id).with_early_return());
+                };
+                // `finally` must not start until the value being returned has been fully
+                // produced: collect it first, like `try-collect` does on the fall-through path.
+                // A `catch` inside that `finally` region doesn't see an error from collecting.
+                let data = ctx.take_reg(reg_id);
+                #[cfg(feature = "os")]
+                let collected = try_collect(data, *span, ctx.stack.stderr());
+                #[cfg(not(feature = "os"))]
+                let collected = collect(data, *span);
+                match collected {
+                    Ok(body) => unwind(
+                        ctx,
+                        &mut pending,
+                        finallys(&covering[first..]),
+                        FinallyInput::Empty,
+                        Terminal::Return(PipelineExecutionData::from(body).with_early_return()),
+                        need_backtrace,
+                    ),
+                    Err(err) => {
+                        let (finallys, terminal) =
+                            plan_error(&covering[first..], err.into_spanned(*span));
+                        let input = FinallyInput::Error(terminal.error().clone());
+                        unwind(ctx, &mut pending, finallys, input, terminal, need_backtrace)
                     }
                 }
-                match ctx.finally_resumes.pop() {
-                    // Entered from `try`/`catch` normally: carry on after the block.
-                    Some(None) => {
-                        pc += 1;
-                        continue;
+            }
+            Ok(InstructionResult::Leave { target, abrupt }) => {
+                // Run the `finally` blocks this leaves: those covering here but not the target.
+                let finallys = finallys(
+                    &covering(regions, pc)
+                        .into_iter()
+                        .filter(|region| !region.covers(target))
+                        .collect::<Vec<_>>(),
+                );
+                let input = if abrupt {
+                    FinallyInput::Empty
+                } else {
+                    FinallyInput::Keep
+                };
+                let terminal = Terminal::Jump(target);
+                unwind(ctx, &mut pending, finallys, input, terminal, need_backtrace)
+            }
+            Ok(InstructionResult::EndFinally) => {
+                // The exit that entered this `finally` (the innermost pending one, which is running
+                // the `finally` ending here) carries on.
+                match pending.take() {
+                    Some(exit) if exit.running.1 == pc + 1 => {
+                        let PendingExit {
+                            finallys,
+                            input,
+                            terminal,
+                            running: _,
+                            outer,
+                        } = *exit;
+                        pending = outer;
+                        unwind(ctx, &mut pending, finallys, input, terminal, need_backtrace)
                     }
-                    // Entered by unwinding: pick up where that left off.
-                    Some(Some(unwind)) => unwind,
-                    None => {
+                    exit => {
                         return Err(ShellError::IrEvalError {
-                            msg: "end-finally without a matching begin-finally".into(),
+                            msg: format!(
+                                "end-finally found no exit running this finally block (found {:?})",
+                                exit.map(|exit| exit.running)
+                            ),
                             span: Some(*span),
                         });
                     }
@@ -363,12 +444,29 @@ fn eval_ir_block_impl<D: DebugContext>(
             }
             // `exit --abort` leaves immediately, without running `finally` blocks
             Err(err @ ShellError::Exit { abort: true, .. }) => return Err(err),
-            Err(err) => Unwind::Error(err.into_spanned(*span)),
+            // `exit` is not something `catch` can handle; only `finally` runs for it, and it
+            // doesn't get to see it.
+            Err(err @ ShellError::Exit { .. }) => unwind(
+                ctx,
+                &mut pending,
+                finallys(&covering(regions, pc)),
+                FinallyInput::Empty,
+                Terminal::Error(err.into_spanned(*span)),
+                need_backtrace,
+            ),
+            Err(err) => {
+                // Every `finally` up to the innermost covering `catch` runs and sees the error;
+                // then the `catch` takes over, or the error leaves the block.
+                let (finallys, terminal) =
+                    plan_error(&covering(regions, pc), err.into_spanned(*span));
+                let input = FinallyInput::Error(terminal.error().clone());
+                unwind(ctx, &mut pending, finallys, input, terminal, need_backtrace)
+            }
         };
 
-        match unwind_through_handlers(ctx, unwind, *span, need_backtrace) {
-            Unwound::Branch(next_pc) => pc = next_pc,
-            Unwound::Return(result) => return *result,
+        match step {
+            Step::Goto(next_pc) => pc = next_pc,
+            Step::Done(result) => return *result,
         }
     }
 
@@ -382,109 +480,192 @@ fn eval_ir_block_impl<D: DebugContext>(
     })
 }
 
-/// Control flow that is leaving a `try` body and has to pass through its handlers first.
+/// A `finally` block to run while unwinding: its body `[target, end)`, and the register it reads
+/// its input from.
+#[derive(Debug, Clone, Copy)]
+struct Finally {
+    target: usize,
+    end: usize,
+    register: Option<RegId>,
+}
+
+/// What a `finally` block entered by unwinding finds in its register.
 #[derive(Debug)]
-enum Unwind {
-    /// An error propagating outward, with the span of the instruction that raised it. This
-    /// includes `exit`, which only `finally` handlers get to see.
+enum FinallyInput {
+    /// The value of the `try` body or `catch` that completed normally, left in place.
+    Keep,
+    /// Empty: for `return`, `exit`, `break`, and `continue`.
+    Empty,
+    /// The error that is unwinding.
     Error(Spanned<ShellError>),
-    /// A `return`, carrying its (early-return flagged) value.
+}
+
+/// What an exit does once the `finally` blocks it leaves have run.
+#[derive(Debug)]
+enum Terminal {
+    /// Jump to an instruction: the end of a `try`, or a loop label for `break` and `continue`.
+    Jump(usize),
+    /// Enter a `catch` block, with the error in its register.
+    Catch {
+        target: usize,
+        register: Option<RegId>,
+        error: Spanned<ShellError>,
+    },
+    /// Leave the block with this (early-return flagged) value.
     Return(PipelineExecutionData),
-    /// A `break` or `continue`: jump to `index` once `handlers` more entries have been unwound.
-    Jump { index: usize, handlers: usize },
+    /// Leave the block with this error.
+    Error(Spanned<ShellError>),
 }
 
-/// Where evaluation continues after [`unwind_through_handlers`].
-enum Unwound {
-    /// Continue at this instruction: a handler took over, or a jump reached its target.
-    Branch(usize),
-    /// No handler is left in this frame: leave the block with this result.
-    Return(Box<Result<PipelineExecutionData, ShellError>>),
+impl Terminal {
+    /// The error of an error unwind.
+    fn error(&self) -> &Spanned<ShellError> {
+        match self {
+            Terminal::Catch { error, .. } | Terminal::Error(error) => error,
+            Terminal::Jump(_) | Terminal::Return(_) => {
+                unreachable!("plan_error only plans error unwinds")
+            }
+        }
+    }
 }
 
-/// Pop handlers off the `try` handler stack until one takes over the unwinding control flow,
-/// or until there are none left in this frame.
+/// An exit in flight while one of its `finally` blocks runs. [`Instruction::EndFinally`]
+/// resumes it.
 ///
-/// A `catch` handler takes over errors (but not `exit`). A `finally` handler takes over
-/// everything: the pending control flow is stashed in `finally_resumes` and picked up again
-/// by `end-finally`. Unwinding out of a `finally` block that is itself running abandons what
-/// that block was going to resume, so e.g. `return` inside `finally` wins over the error that
-/// led there.
-fn unwind_through_handlers(
-    ctx: &mut EvalContext<'_>,
-    mut unwind: Unwind,
-    span: Span,
-    need_backtrace: bool,
-) -> Unwound {
-    loop {
-        if let Unwind::Jump { index, handlers: 0 } = unwind {
-            return Unwound::Branch(index);
-        }
+/// This is the only runtime state of `try`. It does not track which `try` is active (the region
+/// table says that); it tracks what to do when a `finally` that is running ends. Exits nest
+/// when a `finally` block itself exits (say, a `return` in a `try` inside it), so each one
+/// keeps the exit it was raised inside of as `outer`.
+///
+/// When control leaves the `running` body other than through its `end-finally` (a `return`,
+/// `break`, `continue` or error out of the `finally`), the `finally` completes abruptly and this
+/// exit is abandoned in favor of the new one, as in Java (JLS 14.20.2) and Python. That check
+/// happens at every transfer [`unwind`] makes, in [`abandon_left_exits`].
+#[derive(Debug)]
+struct PendingExit {
+    /// The `finally` blocks still to run after the current one, outermost first (so `pop`
+    /// gives the next).
+    finallys: Vec<Finally>,
+    input: FinallyInput,
+    terminal: Terminal,
+    /// The body `[start, end)` of the `finally` block running for this exit.
+    running: (usize, usize),
+    outer: Option<Box<PendingExit>>,
+}
 
-        let Some(handler) = ctx.stack.error_handlers.pop(ctx.error_handler_base) else {
-            return Unwound::Return(Box::new(match unwind {
-                Unwind::Error(err) if need_backtrace => {
-                    Err(ShellError::into_chained(err.item, err.span))
-                }
-                Unwind::Error(err) => Err(err.item),
-                Unwind::Return(data) => Ok(data),
-                Unwind::Jump { .. } => Err(ShellError::IrEvalError {
-                    msg: "unwind-jump ran out of handlers before reaching its target".into(),
-                    span: Some(span),
-                }),
-            }));
-        };
+/// Where evaluation continues after [`unwind`].
+enum Step {
+    /// Continue at this instruction.
+    Goto(usize),
+    /// Leave the block with this result.
+    Done(Box<Result<PipelineExecutionData, ShellError>>),
+}
 
-        if let Unwind::Jump { handlers, .. } = &mut unwind {
-            *handlers -= 1;
-        }
+/// The `try` regions covering instruction `pc`, innermost (smallest) first.
+fn covering(regions: &[TryRegion], pc: usize) -> Vec<&TryRegion> {
+    let mut covering: Vec<&TryRegion> = regions.iter().filter(|r| r.covers(pc)).collect();
+    covering.sort_by_key(|r| r.end - r.start);
+    covering
+}
 
-        match handler {
-            TryHandler::Catch(handler) => match unwind {
-                // `exit` is not something `catch` can handle; only `finally` runs for it.
-                Unwind::Error(err) if !matches!(err.item, ShellError::Exit { .. }) => {
-                    reset_signals_if_interrupted(ctx, &err.item);
-                    prepare_error_handler(ctx, handler, Some(err));
-                    return Unwound::Branch(handler.handler_index);
-                }
-                // Anything else just discards the `catch` handler on its way out.
-                _ => {}
+/// The `finally` blocks of `regions` (innermost first), as a [`PendingExit::finallys`] list.
+fn finallys(regions: &[&TryRegion]) -> Vec<Finally> {
+    regions
+        .iter()
+        .rev()
+        .filter(|r| r.kind == TryRegionKind::Finally)
+        .map(|r| Finally {
+            target: r.target,
+            end: r.handler_end,
+            register: r.error_register,
+        })
+        .collect()
+}
+
+/// Plan an error unwind through `regions` (innermost first): every `finally` up to the first
+/// `catch`, which handles the error, or all of them if there is no `catch` and the error leaves
+/// the block.
+fn plan_error(regions: &[&TryRegion], error: Spanned<ShellError>) -> (Vec<Finally>, Terminal) {
+    match regions.iter().position(|r| r.kind == TryRegionKind::Catch) {
+        Some(index) => (
+            finallys(&regions[..index]),
+            Terminal::Catch {
+                target: regions[index].target,
+                register: regions[index].error_register,
+                error,
             },
-            TryHandler::Finally(handler) => {
-                // `finally` must not start until the value being returned has been fully
-                // produced: collect it first, like `try-collect` does on the fall-through path.
-                if let Unwind::Return(data) = unwind {
-                    #[cfg(feature = "os")]
-                    let collected = try_collect(data, span, ctx.stack.stderr());
-                    #[cfg(not(feature = "os"))]
-                    let collected = collect(data, span);
-                    unwind = match collected {
-                        Ok(body) => {
-                            Unwind::Return(PipelineExecutionData::from(body).with_early_return())
-                        }
-                        Err(err) => Unwind::Error(err.into_spanned(span)),
-                    };
+        ),
+        None => (finallys(regions), Terminal::Error(error)),
+    }
+}
+
+/// Run the next of `finallys`, keeping the rest and `terminal` as the pending exit; or, when
+/// none are left, perform `terminal`.
+fn unwind(
+    ctx: &mut EvalContext<'_>,
+    pending: &mut Option<Box<PendingExit>>,
+    mut finallys: Vec<Finally>,
+    input: FinallyInput,
+    terminal: Terminal,
+    need_backtrace: bool,
+) -> Step {
+    if let Some(next) = finallys.pop() {
+        abandon_left_exits(pending, next.target);
+        if let Some(reg_id) = next.register {
+            match &input {
+                FinallyInput::Keep => (),
+                FinallyInput::Empty => ctx.put_reg(reg_id, PipelineExecutionData::empty()),
+                FinallyInput::Error(error) => {
+                    reset_signals_if_interrupted(ctx, &error.item);
+                    put_error(ctx, reg_id, error.clone());
                 }
-                // The block gets to see the error that led to it (but not `exit`), otherwise
-                // its register is set to empty.
-                let error = match &unwind {
-                    Unwind::Error(err) if !matches!(err.item, ShellError::Exit { .. }) => {
-                        reset_signals_if_interrupted(ctx, &err.item);
-                        Some(err.clone())
-                    }
-                    _ => None,
-                };
-                prepare_error_handler(ctx, handler, error);
-                ctx.stack.error_handlers.push(TryHandler::RunningFinally);
-                ctx.finally_resumes.push(Some(unwind));
-                return Unwound::Branch(handler.handler_index);
-            }
-            TryHandler::RunningFinally => {
-                // Leaving a running `finally` block: whatever it was going to resume is replaced
-                // by this unwinding.
-                ctx.finally_resumes.pop();
             }
         }
+        let outer = pending.take();
+        *pending = Some(Box::new(PendingExit {
+            finallys,
+            input,
+            terminal,
+            running: (next.target, next.end),
+            outer,
+        }));
+        return Step::Goto(next.target);
+    }
+    match terminal {
+        Terminal::Jump(target) => {
+            abandon_left_exits(pending, target);
+            Step::Goto(target)
+        }
+        Terminal::Catch {
+            target,
+            register,
+            error,
+        } => {
+            abandon_left_exits(pending, target);
+            reset_signals_if_interrupted(ctx, &error.item);
+            if let Some(reg_id) = register {
+                put_error(ctx, reg_id, error);
+            }
+            Step::Goto(target)
+        }
+        Terminal::Return(data) => Step::Done(Box::new(Ok(data))),
+        Terminal::Error(error) if need_backtrace => Step::Done(Box::new(Err(
+            ShellError::into_chained(error.item, error.span),
+        ))),
+        Terminal::Error(error) => Step::Done(Box::new(Err(error.item))),
+    }
+}
+
+/// Abandon each pending exit whose running `finally` body does not contain `target`: control is
+/// leaving that `finally` abruptly, so whatever it was going to resume is dropped.
+fn abandon_left_exits(pending: &mut Option<Box<PendingExit>>, target: usize) {
+    while let Some(exit) = pending.take() {
+        let (start, end) = exit.running;
+        if start <= target && target < end {
+            *pending = Some(exit);
+            break;
+        }
+        *pending = exit.outer;
     }
 }
 
@@ -496,35 +677,24 @@ fn reset_signals_if_interrupted(ctx: &EvalContext<'_>, err: &ShellError) {
     }
 }
 
-/// Prepare the context for an error handler
-fn prepare_error_handler(
-    ctx: &mut EvalContext<'_>,
-    error_handler: ErrorHandler,
-    error: Option<Spanned<ShellError>>,
-) {
-    if let Some(reg_id) = error_handler.error_register {
-        if let Some(error) = error {
-            // Stack state has to be updated for stuff like LAST_EXIT_CODE
-            ctx.stack.set_last_error(&error.item);
-            // Create the error value and put it in the register
-            ctx.put_reg(
-                reg_id,
-                PipelineExecutionData::from(
-                    error
-                        .item
-                        .into_full_value(
-                            &StateWorkingSet::new(ctx.engine_state),
-                            ctx.stack,
-                            error.span,
-                        )
-                        .into_pipeline_data(),
-                ),
-            );
-        } else {
-            // Set the register to empty
-            ctx.put_reg(reg_id, PipelineExecutionData::empty());
-        }
-    }
+/// Put an error into the register of a `catch` or `finally` block.
+fn put_error(ctx: &mut EvalContext<'_>, reg_id: RegId, error: Spanned<ShellError>) {
+    // Stack state has to be updated for stuff like LAST_EXIT_CODE
+    ctx.stack.set_last_error(&error.item);
+    // Create the error value and put it in the register
+    ctx.put_reg(
+        reg_id,
+        PipelineExecutionData::from(
+            error
+                .item
+                .into_full_value(
+                    &StateWorkingSet::new(ctx.engine_state),
+                    ctx.stack,
+                    error.span,
+                )
+                .into_pipeline_data(),
+        ),
+    );
 }
 
 /// The result of performing an instruction. Describes what should happen next
@@ -535,17 +705,16 @@ enum InstructionResult {
     Return(RegId),
     /// Return from the block before reaching the end, carrying the full register contents.
     ///
-    /// Unlike `Return`, this runs any pending `finally` handlers before the value leaves the
+    /// Unlike `Return`, this runs any covering `finally` blocks before the value leaves the
     /// block, and flags the resulting data as an early return. The flag exists for one consumer:
     /// top-level file evaluation, which reads it to skip `main`. Custom command calls and closure
     /// invocations clear the flag instead, so a `return` in a nested call can't leak out and be
     /// mistaken for a `return` at the current level.
     ReturnEarly(RegId),
-    /// Jump to `index` after unwinding `handlers` entries of the `try` handler stack, running
-    /// any `finally` blocks among them.
-    UnwindJump {
-        index: usize,
-        handlers: usize,
+    /// Jump to `target`, running the `finally` blocks whose regions this leaves first.
+    Leave {
+        target: usize,
+        abrupt: bool,
     },
     /// Leave a `finally` block, resuming whatever control flow led into it.
     EndFinally,
@@ -652,16 +821,7 @@ fn eval_instruction<D: DebugContext>(
                 ctx.stack.last_result_pipeline_data(*span)
             } else if *preserve_origin {
                 // Keep definition span (e.g. `metadata $x`).
-                let value = ctx
-                    .stack
-                    .get_var_with_origin(*var_id, *span)
-                    .or_else(|err| {
-                        if let Some(const_val) = ctx.engine_state.get_constant(*var_id).cloned() {
-                            Ok(const_val)
-                        } else {
-                            Err(err)
-                        }
-                    })?;
+                let value = get_var_with_origin(ctx, *var_id, *span)?;
                 value.into_pipeline_data()
             } else {
                 let value = get_var(ctx, *var_id, *span)?;
@@ -693,12 +853,23 @@ fn eval_instruction<D: DebugContext>(
                 ctx.put_reg(*dst, PipelineExecutionData::from(new_value));
                 Ok(Continue)
             } else {
-                // FIXME: using the same span twice, shouldn't this really be
-                // EnvVarNotFoundAtRuntime? There are tests that depend on CantFindColumn though...
-                Err(ShellError::CantFindColumn {
-                    col_name: key.into(),
-                    span: Some(*span),
-                    src_span: *span,
+                // Display the key name as it would be written in a cell path: "bare" when
+                // it starts with a letter or `_` and holds only letters, digits, `_` and `-`
+                let bare = key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                let member = if bare {
+                    key.to_string()
+                } else {
+                    nu_utils::escape_quote_string(key)
+                };
+                Err(ShellError::EnvVarNotFoundAtRuntime {
+                    envvar_name: key.into(),
+                    span: *span,
+                    help: Some(format!(
+                        "use `$env.{member}?` to get `null` if it isn't set (add `?` after any members that follow it, too), or pipe it to `default <value>`"
+                    )),
                 })
             }
         }
@@ -1012,12 +1183,17 @@ fn eval_instruction<D: DebugContext>(
 
             let key = key.coerce_into_string()?;
             if let Some(old_value) = record.insert(&key, val) {
+                let first_item = ctx.record_item_of_key(*src_dst, &record, &key);
                 return Err(ShellError::ColumnDefinedTwice {
                     col_name: key,
                     second_use: *span,
-                    first_use: old_value.span(),
+                    first_use: first_item.map_or_else(|| old_value.span(), |item| item.span),
+                    help: first_item
+                        .filter(|item| item.is_spread)
+                        .map(|_| ShellError::RECORD_SPREAD_DUPLICATE_HELP.into()),
                 });
             }
+            ctx.push_record_item(*src_dst, record.len(), *span, false);
 
             ctx.put_reg(
                 *src_dst,
@@ -1041,13 +1217,18 @@ fn eval_instruction<D: DebugContext>(
             // Not using .extend() here because it doesn't handle duplicates
             for (key, val) in items {
                 if let Some(first_value) = record.insert(&key, val) {
+                    let first_use = ctx
+                        .record_item_of_key(*src_dst, &record, &key)
+                        .map_or_else(|| first_value.span(), |item| item.span);
                     return Err(ShellError::ColumnDefinedTwice {
                         col_name: key,
                         second_use: *span,
-                        first_use: first_value.span(),
+                        first_use,
+                        help: Some(ShellError::RECORD_SPREAD_DUPLICATE_HELP.into()),
                     });
                 }
             }
+            ctx.push_record_item(*src_dst, record.len(), *span, true);
             ctx.put_reg(
                 *src_dst,
                 PipelineExecutionData::from(
@@ -1256,61 +1437,10 @@ fn eval_instruction<D: DebugContext>(
             stream,
             end_index,
         } => eval_iterate(ctx, *dst, *stream, *end_index, *span),
-        Instruction::UnwindJump { index, handlers } => Ok(InstructionResult::UnwindJump {
-            index: *index,
-            handlers: *handlers,
+        Instruction::Leave { index, abrupt } => Ok(InstructionResult::Leave {
+            target: *index,
+            abrupt: *abrupt,
         }),
-        Instruction::OnError { index } => {
-            ctx.stack
-                .error_handlers
-                .push(TryHandler::Catch(ErrorHandler {
-                    handler_index: *index,
-                    error_register: None,
-                }));
-            Ok(Continue)
-        }
-        Instruction::OnErrorInto { index, dst } => {
-            ctx.stack
-                .error_handlers
-                .push(TryHandler::Catch(ErrorHandler {
-                    handler_index: *index,
-                    error_register: Some(*dst),
-                }));
-            Ok(Continue)
-        }
-        Instruction::FinallyInto { index, dst } => {
-            ctx.stack
-                .error_handlers
-                .push(TryHandler::Finally(ErrorHandler {
-                    handler_index: *index,
-                    error_register: Some(*dst),
-                }));
-            Ok(Continue)
-        }
-        Instruction::PopErrorHandler => {
-            match ctx.stack.error_handlers.pop(ctx.error_handler_base) {
-                Some(TryHandler::Catch(_)) => Ok(Continue),
-                handler => Err(ShellError::IrEvalError {
-                    msg: format!("pop-error-handler expected a catch handler, found {handler:?}"),
-                    span: Some(*span),
-                }),
-            }
-        }
-        Instruction::BeginFinally => {
-            // Fall-through entry into a `finally` block: swap the handler for a running marker
-            // with nothing to resume afterwards. Unwinding entries do this swap themselves.
-            match ctx.stack.error_handlers.pop(ctx.error_handler_base) {
-                Some(TryHandler::Finally(_)) => {
-                    ctx.stack.error_handlers.push(TryHandler::RunningFinally);
-                    ctx.finally_resumes.push(None);
-                    Ok(Continue)
-                }
-                handler => Err(ShellError::IrEvalError {
-                    msg: format!("begin-finally expected a finally handler, found {handler:?}"),
-                    span: Some(*span),
-                }),
-            }
-        }
         Instruction::EndFinally => Ok(InstructionResult::EndFinally),
         Instruction::ReturnEarly { src } => Ok(InstructionResult::ReturnEarly(*src)),
         Instruction::Return { src } => Ok(Return(*src)),
@@ -1329,6 +1459,10 @@ fn load_literal(
     // represents the `null` value and should produce `PipelineData::Value(Value::Nothing)`.
     // Some commands (like `metadata`) distinguish between these when deciding
     // whether positional args are allowed.
+    // A new record literal starts here: forget the items of an earlier one.
+    if matches!(lit, Literal::Record { .. }) {
+        ctx.record_items[dst.get() as usize].clear();
+    }
     if matches!(lit, Literal::Empty) {
         ctx.put_reg(dst, PipelineExecutionData::empty());
     } else {
@@ -1355,10 +1489,14 @@ fn literal_value(
         Literal::Binary(bin) => Value::binary(&ctx.data[*bin], span),
         Literal::Block(block_id) | Literal::RowCondition(block_id) | Literal::Closure(block_id) => {
             let block = ctx.engine_state.get_block(*block_id);
+            // Captured values keep the span they were defined with, so `metadata $x` inside the
+            // closure gives the same span as outside of it.
             let captures = block
                 .captures
                 .iter()
-                .map(|(var_id, span)| get_var(ctx, *var_id, *span).map(|val| (*var_id, val)))
+                .map(|(var_id, span)| {
+                    get_var_with_origin(ctx, *var_id, *span).map(|val| (*var_id, val))
+                })
                 .collect::<Result<Vec<_>, ShellError>>()?;
             Value::closure(
                 Closure {
@@ -1465,6 +1603,8 @@ fn binary_op(
             Comparison::NotStartsWith => lhs_val.not_starts_with(op_span, &rhs_val, span)?,
             Comparison::EndsWith => lhs_val.ends_with(op_span, &rhs_val, span)?,
             Comparison::NotEndsWith => lhs_val.not_ends_with(op_span, &rhs_val, span)?,
+            Comparison::OlderThan => lhs_val.older_than(op_span, &rhs_val, span)?,
+            Comparison::NewerThan => lhs_val.newer_than(op_span, &rhs_val, span)?,
         },
         Operator::Math(mat) => match mat {
             Math::Add => lhs_val.add(op_span, &rhs_val, span)?,
@@ -1555,16 +1695,30 @@ fn eval_call<D: DebugContext>(
 }
 
 /// Evaluate a call to a command the way compiled code calls it. The call's arguments must be the
-/// last ones on `stack`, which is where [`CallBuilder`](nu_protocol::ir::CallBuilder) puts them.
+/// last ones on `stack`, which is where [`CallBuilder`] puts them.
 ///
 /// The input is type checked and record spreads become flags. A custom command binds its
 /// parameters and runs its block; any other command goes through
 /// [`Command::run`](nu_protocol::engine::Command::run). Use this rather than calling `run` on a
 /// command found by name, like a `from <ext>` converter, because it may be a custom command.
 ///
-/// Call [`Call::leave`] afterwards to reset the argument stack, whether or not the command
-/// consumed the arguments.
+/// This takes the builder so that a caller can't forget to clean up: the call's arguments are off
+/// the stack when this returns, whatever the result. A caller that builds a call and then doesn't
+/// run it removes them with [`Call::leave`].
 pub fn eval_ir_call(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    call: CallBuilder,
+    input: PipelineData,
+) -> Result<PipelineData, ShellError> {
+    let call = call.finish();
+    let result = eval_finished_call(engine_state, stack, &call, input);
+    call.leave(stack);
+    result
+}
+
+/// The checks and the run of [`eval_ir_call`], which cleans up after any return from here.
+fn eval_finished_call(
     engine_state: &EngineState,
     stack: &mut Stack,
     call: &Call,
@@ -1666,7 +1820,7 @@ fn eval_call_frame<D: DebugContext>(
 
         result
     } else {
-        let signature = decl.signature();
+        let signature = engine_state.get_signature_cached(decl_id);
 
         // `ignore` intentionally handles upstream error values at command level.
         // Skip early input-error propagation for the built-in `ignore` command so
@@ -1953,7 +2107,7 @@ fn check_type(val: &Value, ty: &Type) -> Result<(), ShellError> {
             to_type: ty.to_string(),
             from_type: val.get_type().to_string(),
             span: val.span(),
-            help: None,
+            help: val.explain_type_mismatch(ty),
         }),
     }
 }
@@ -1985,6 +2139,10 @@ fn check_assignment_type(
                 format!("expected {expected}, got {actual}"),
                 assignment_span,
             );
+
+            if let Some(help) = val.explain_type_mismatch(target_ty) {
+                err = err.with_help(help);
+            }
 
             Err(ShellError::LabeledError(err.into()))
         }
@@ -2056,6 +2214,23 @@ fn check_input_types(
             msg: "Command input type strings is empty, despite being non-zero earlier".to_string(),
         }),
     }
+}
+
+/// Get a variable with the span it was defined with, for `metadata $x` and closure captures.
+///
+/// Values with no source location of their own, like `$nu.pid` or `$NU_LIB_DIRS`, take `span`
+/// instead, because their placeholder span would point an error label at the host env vars.
+fn get_var_with_origin(
+    ctx: &EvalContext<'_>,
+    var_id: VarId,
+    span: Span,
+) -> Result<Value, ShellError> {
+    let value = ctx
+        .stack
+        .get_var_with_origin(var_id, span)
+        .or_else(|err| ctx.engine_state.get_constant(var_id).cloned().ok_or(err))?;
+    let origin = value.span().fallback(span);
+    Ok(value.with_span(origin))
 }
 
 /// Get variable from [`Stack`] or [`EngineState`]
@@ -2260,6 +2435,7 @@ fn drain(
                 }
             }
         }
+        PipelineData::Value(Value::Error { error, .. }, ..) => return Err(*error),
         PipelineData::Value(..) | PipelineData::Empty => {}
     }
 
@@ -2438,7 +2614,6 @@ mod tests {
         let mut stack = Stack::new();
         let mut call = Call::build(DeclId::new(0), Span::test_data());
         call.add_positional(&mut stack, Span::test_data(), Value::test_int(1));
-        let call = call.finish();
         // Another call's argument now sits above this call's.
         Call::build(DeclId::new(0), Span::test_data()).add_positional(
             &mut stack,
@@ -2446,7 +2621,7 @@ mod tests {
             Value::test_int(2),
         );
 
-        let result = eval_ir_call(&engine_state, &mut stack, &call, PipelineData::empty());
+        let result = eval_ir_call(&engine_state, &mut stack, call, PipelineData::empty());
         assert!(matches!(result, Err(ShellError::IrEvalError { .. })));
     }
 
@@ -2454,14 +2629,33 @@ mod tests {
     fn eval_ir_call_stops_when_interrupted() {
         let mut engine_state = EngineState::new();
         engine_state.set_signals(Signals::new(Arc::new(AtomicBool::new(true))));
-        let call = Call::build(DeclId::new(0), Span::test_data()).finish();
 
         let result = eval_ir_call(
             &engine_state,
             &mut Stack::new(),
-            &call,
+            Call::build(DeclId::new(0), Span::test_data()),
             PipelineData::empty(),
         );
         assert!(matches!(result, Err(ShellError::Interrupted { .. })));
+    }
+
+    #[test]
+    fn eval_ir_call_removes_only_its_own_arguments_when_it_stops_early() {
+        let mut engine_state = EngineState::new();
+        engine_state.set_signals(Signals::new(Arc::new(AtomicBool::new(true))));
+        let mut stack = Stack::new();
+        // An argument of a call that's still being built, which has to survive.
+        Call::build(DeclId::new(0), Span::test_data()).add_positional(
+            &mut stack,
+            Span::test_data(),
+            Value::test_int(1),
+        );
+        let mut call = Call::build(DeclId::new(0), Span::test_data());
+        call.add_positional(&mut stack, Span::test_data(), Value::test_int(2));
+
+        let result = eval_ir_call(&engine_state, &mut stack, call, PipelineData::empty());
+
+        assert!(matches!(result, Err(ShellError::Interrupted { .. })));
+        assert_eq!(stack.arguments.get_base(), 1);
     }
 }
